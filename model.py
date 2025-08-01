@@ -8,19 +8,31 @@ from torch_geometric.nn import (
     global_max_pool,
     TopKPooling,
 )
-
+from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 class GraphNeuralNetwork(nn.Module):
     def __init__(self, input_dim=100, hidden_dim=128, output_dim=256, dropout=0.5, 
-                 use_topk_pooling=True, topk_ratio=0.5):
+                 use_topk_pooling=True, topk_ratio=0.5, layer_type):
         super(GraphNeuralNetwork, self).__init__()
 
         self.use_topk_pooling = use_topk_pooling
         self.topk_ratio = topk_ratio
 
-        # GCN layers
-        self.conv1 = GCNConv(input_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
-        self.conv3 = GCNConv(hidden_dim, output_dim)
+        if layer_type == "GCN":
+            self.conv1 = GCNConv(input_dim, hidden_dim)
+            self.conv2 = GCNConv(hidden_dim, hidden_dim)
+            self.conv3 = GCNConv(hidden_dim, output_dim)
+        elif layer_type == "GAT":
+            self.conv1 = GATConv(input_dim, hidden_dim)
+            self.conv2 = GATConv(hidden_dim, hidden_dim)
+            self.conv3 = GATConv(hidden_dim, output_dim)
+        elif layer_type == "GraphSAGE":
+            self.conv1 = SAGEConv(input_dim, hidden_dim)
+            self.conv2 = SAGEConv(hidden_dim, hidden_dim)
+            self.conv3 = SAGEConv(hidden_dim, output_dim)
+
+        else:
+            raise ValueError(f"Unknown layer type: {layer_type}")
+        
         
         # Graph normalization layers (per-graph stats)
         self.gn1 = GraphNorm(hidden_dim)

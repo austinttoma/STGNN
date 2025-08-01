@@ -41,19 +41,18 @@ parser.add_argument('--freeze_encoder', action='store_true', help='whether to fr
 parser.add_argument('--use_pretrained', action='store_true', help='use an existing pretrained encoder if it is on disk')
 parser.add_argument('--use_topk_pooling', action='store_true', default=True, help='use TopK pooling instead of global pooling')
 parser.add_argument('--topk_ratio', type=float, default=0.5, help='TopK pooling ratio (fraction of nodes to keep)')
+parser.add_argument('--layer_type', type=str, default="GCN", help='TopK pooling ratio (fraction of nodes to keep)')
+parser.add_argument('--gnn_hidden_dim', type=int, default=128, help='TopK pooling ratio (fraction of nodes to keep)')
 
 opt = parser.parse_args()
 
-# Validate TopK ratio
 if opt.use_topk_pooling and (opt.topk_ratio <= 0.0 or opt.topk_ratio > 1.0):
     print(f"Warning: Invalid topk_ratio {opt.topk_ratio}. Setting to 0.5 (keep 50% of nodes)")
     opt.topk_ratio = 0.5
 
-#Checks if opt path exists
 if not os.path.exists(opt.save_path):
     os.makedirs(opt.save_path)
 
-# Results obtained from Cross Validation with Mean and Standard Deviation
 fold_results = {
     'test_acc': [],
     'balanced_acc': [],
@@ -70,7 +69,7 @@ fold_results = {
 def graph_augmentation(data, aug_type="drop_node", aug_ratio=0.2):
     """Simple graph augmentation for GraphCL-style pretraining."""
     data = data.clone()
-    device = data.x.device  # Get device from input data
+    device = data.x.device
 
     if aug_type == "drop_node":
         num_nodes = data.x.size(0)  # Use actual number of nodes from feature tensor
@@ -122,7 +121,6 @@ def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, l
     for epoch in range(epochs):
         total_loss = 0.0
         for batch in loader:
-            # Move batch to GPU first, then convert to data list
             batch = batch.to(device)
             data_list = batch.to_data_list()
 
@@ -152,7 +150,6 @@ def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, l
 # LOAD DATASET
 ##################
 
-# Load FC matrices stored under 'fc_matrix' key instead of default 'arr_0'
 dataset = FC_ADNIDataset(
     root="/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data",
     var_name="fc_matrix"  # key present in .npz files
@@ -181,7 +178,6 @@ for subject_id in dataset.subject_graph_dict:
         dataset.subject_graph_dict[subject_id] = visits[-opt.max_visits:]
         print(f"[TRIMMED] Subject {subject_id}: {original_len} → {len(dataset.subject_graph_dict[subject_id])}")
 
-# Subject-level stratified split
 def get_kfold_splits(dataset, num_folds=5, seed=42):
     subject_labels = {}
     for subj_id, graphs in dataset.subject_graph_dict.items():
@@ -236,16 +232,13 @@ def get_kfold_splits(dataset, num_folds=5, seed=42):
 
     return fold_splits
 
-# Perform split
 fold_splits = get_kfold_splits(dataset, num_folds=opt.num_folds)
 
-# Device and model setup (before cross-validation)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Graph encoder for embedding extraction with TopK pooling
-encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=128, output_dim=256, dropout=0.5, 
-                           use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio).to(device)
-# === PRETRAIN EXECUTION LOGIC (ONCE BEFORE CV) ===
+encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, output_dim=256, dropout=0.5, 
+                           use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio, layer_type=opt.layer_type).to(device)
+
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
 if hasattr(opt, 'pretrain_encoder') and opt.pretrain_encoder:
     if hasattr(opt, 'use_pretrained') and opt.use_pretrained and os.path.exists(pretrained_path):
@@ -315,8 +308,8 @@ for fold, split in enumerate(fold_splits):
 
     if(opt.model_type == "LSTM"):
         classifier = TemporalTabGNNClassifier(
-            graph_emb_dim=512,  # 256*2 from concatenated pooling in GraphNeuralNetwork
-            tab_emb_dim=0,      # No tabular data
+            graph_emb_dim=512,
+            tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
             dropout=0.5,
@@ -325,8 +318,8 @@ for fold, split in enumerate(fold_splits):
         ).to(device)
     elif(opt.model_type == "GRU"):
         classifier = GRUPredictor(
-            graph_emb_dim=512,  # 256*2 from concatenated pooling in GraphNeuralNetwork
-            tab_emb_dim=0,      # No tabular data
+            graph_emb_dim=512,
+            tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
             dropout=0.5,
@@ -335,8 +328,8 @@ for fold, split in enumerate(fold_splits):
         ).to(device)
     elif(opt.model_type == "RNN"):
         classifier = RNNPredictor(
-            graph_emb_dim=512,  # 256*2 from concatenated pooling in GraphNeuralNetwork
-            tab_emb_dim=0,      # No tabular data
+            graph_emb_dim=512,
+            tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
             dropout=0.5,
@@ -348,9 +341,9 @@ for fold, split in enumerate(fold_splits):
     encoder_params = list(fold_encoder.parameters())
     classifier_params = list(classifier.parameters())
 
-    optimizer = torch.optim.AdamW([
-        {'params': encoder_params, 'lr': opt.lr * 0.5, 'weight_decay': 0.01},
-        {'params': classifier_params, 'lr': opt.lr, 'weight_decay': 0.005}
+    optimizer = torch.optim.Adam([
+        {'params': encoder_params, 'lr': opt.lr * 0.5},
+        {'params': classifier_params, 'lr': opt.lr}
     ], betas=(0.9, 0.999))
 
     # Scheduler
@@ -407,17 +400,13 @@ for fold, split in enumerate(fold_splits):
             all_targets, all_preds, average=None, zero_division=0
         )
         
-        # Minority class specific metrics
         minority_precision = precision[1] if len(precision) > 1 else 0
         minority_recall = recall[1] if len(recall) > 1 else 0
         minority_f1 = f1[1] if len(f1) > 1 else 0
         
-        # Balanced accuracy
         balanced_acc = np.mean([recall[0] if len(recall) > 0 else 0, 
                                 recall[1] if len(recall) > 1 else 0])
         
-        # Calculate AUC
-        # Get probabilities for positive class (class 1)
         probs_positive = np.array(all_probs)[:, 1]
         auc_score = roc_auc_score(all_targets, probs_positive)
         
@@ -498,17 +487,12 @@ for fold, split in enumerate(fold_splits):
             # Main loss
             loss = criterion(logits, labels)
             
-
-            # Minority class forcing loss (early epochs only)
             forcing_loss = minority_class_forcing_loss(logits, labels, epoch)
 
-            # Combined loss
             total_batch_loss = loss + forcing_loss
             
-            # Backward pass
             total_batch_loss.backward()
             
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(
                 list(fold_encoder.parameters()) + list(classifier.parameters()), 
                 max_norm=1.0
@@ -516,32 +500,26 @@ for fold, split in enumerate(fold_splits):
             
             optimizer.step()
             
-            # Accumulate losses
             total_loss += total_batch_loss.item()
             total_focal_loss += loss.item()
             total_forcing_loss += forcing_loss.item()
             
-            # Accuracy
             preds = logits.argmax(dim=1)
             correct += (preds == labels).sum().item()
             total += labels.size(0)
             
-            # Track predictions
             class_0_preds += (preds == 0).sum().item()
             class_1_preds += (preds == 1).sum().item()
             
         
         scheduler.step()
         
-        # Calculate training metrics
         avg_loss = total_loss / len(train_loader)
         train_acc = correct / total
         
-        # Evaluate on validation set
         val_results = evaluate_detailed(val_loader)
         
         current_lr = optimizer.param_groups[0]['lr']
-        
         
         # Model saving based on minority class F1 and balanced accuracy
         current_score = val_results['minority_f1'] + val_results['balanced_accuracy']
@@ -598,7 +576,6 @@ for fold, split in enumerate(fold_splits):
                                 target_names=['Stable', 'Converter'],
                                 zero_division=0))
 
-    # Store results for cross-validation summary
     fold_results['test_acc'].append(test_results['accuracy'])
     fold_results['balanced_acc'].append(test_results['balanced_accuracy'])
     fold_results['minority_f1'].append(test_results['minority_f1'])
@@ -606,7 +583,6 @@ for fold, split in enumerate(fold_splits):
     fold_results['train_acc'].append(train_results['accuracy'])
     fold_results['balanced_train_acc'].append(train_results['balanced_accuracy'])
 
-# After all folds, print summary
 print("\nCross-Validation Summary:")
 for metric, values in fold_results.items():
     if values:  # Avoid empty lists
