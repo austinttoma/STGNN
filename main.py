@@ -18,13 +18,15 @@ from GRUPredictor import GRUPredictor
 from RNNPredictor import RNNPredictor
 from TemporalDataLoader import TemporalDataLoader
 from FocalLoss import FocalLoss
+from conversion_analyzer import analyze_conversion_predictions, print_conversion_accuracy_report, aggregate_conversion_results
+import random
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size for temporal sequences (subjects per batch)')
-parser.add_argument('--lr', type=float, default=0.005, help='learning rate')
-parser.add_argument('--focal_alpha', type=float, default=0.9, help='focal loss alpha (weight for minority class)')
-parser.add_argument('--focal_gamma', type=float, default=3.0, help='focal loss gamma (focusing parameter)')
+parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
+parser.add_argument('--focal_alpha', type=float, default=0.8, help='focal loss alpha (weight for minority class)')
+parser.add_argument('--focal_gamma', type=float, default=2.0, help='focal loss gamma (focusing parameter)')
 parser.add_argument('--label_smoothing', type=float, default=0.05, help='label smoothing factor')
 parser.add_argument('--save_path', type=str, default='./model/', help='path to save model')
 parser.add_argument('--save_model', type=bool, default=True)
@@ -41,10 +43,25 @@ parser.add_argument('--freeze_encoder', action='store_true', help='whether to fr
 parser.add_argument('--use_pretrained', action='store_true', help='use an existing pretrained encoder if it is on disk')
 parser.add_argument('--use_topk_pooling', action='store_true', default=True, help='use TopK pooling instead of global pooling')
 parser.add_argument('--topk_ratio', type=float, default=0.5, help='TopK pooling ratio (fraction of nodes to keep)')
-parser.add_argument('--layer_type', type=str, default="GCN", help='TopK pooling ratio (fraction of nodes to keep)')
-parser.add_argument('--gnn_hidden_dim', type=int, default=128, help='TopK pooling ratio (fraction of nodes to keep)')
+parser.add_argument('--layer_type', type=str, default="GCN", help='GNN layer type: GCN, GAT, or GraphSAGE')
+parser.add_argument('--gnn_hidden_dim', type=int, default=128, help='GNN hidden dimension size')
+parser.add_argument('--gnn_num_layers', type=int, default=3, help='number of GNN layers (2-5)')
+parser.add_argument('--gnn_activation', type=str, default='relu', help='GNN activation function: relu, leaky_relu, elu, gelu')
 
 opt = parser.parse_args()
+
+def set_random_seeds(seed=42):
+      """Set all random seeds for reproducibility"""
+
+      random.seed(seed)
+      np.random.seed(seed)
+      torch.manual_seed(seed)
+      torch.cuda.manual_seed(seed)
+      torch.cuda.manual_seed_all(seed)
+      torch.backends.cudnn.deterministic = True
+      torch.backends.cudnn.benchmark = False
+
+set_random_seeds(42)
 
 if opt.use_topk_pooling and (opt.topk_ratio <= 0.0 or opt.topk_ratio > 1.0):
     print(f"Warning: Invalid topk_ratio {opt.topk_ratio}. Setting to 0.5 (keep 50% of nodes)")
@@ -62,14 +79,20 @@ fold_results = {
     'balanced_train_acc': []
 }
 
+fold_conversion_results = []
+
 ###################
 # GNN PRETRAINING UTILITIES
 ###################
 
-def graph_augmentation(data, aug_type="drop_node", aug_ratio=0.2):
+def graph_augmentation(data, aug_type="drop_node", aug_ratio=0.2, seed=None):
     """Simple graph augmentation for GraphCL-style pretraining."""
     data = data.clone()
     device = data.x.device
+    
+    # Set seed for reproducible augmentation
+    if seed is not None:
+        torch.manual_seed(seed)
 
     if aug_type == "drop_node":
         num_nodes = data.x.size(0)  # Use actual number of nodes from feature tensor
@@ -115,7 +138,11 @@ def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, l
     """GraphCL-style self-supervised pretraining for the GNN encoder."""
     encoder.train()
     optimizer = torch.optim.Adam(encoder.parameters(), lr=lr)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+    # Create seeded generator for reproducible data loading
+    g = torch.Generator()
+    g.manual_seed(42)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
+                       num_workers=0, generator=g)
 
     print(f"Pretraining GNN Encoder for {epochs} epochs (GraphCL)")
     for epoch in range(epochs):
@@ -124,8 +151,9 @@ def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, l
             batch = batch.to(device)
             data_list = batch.to_data_list()
 
-            batch1 = [graph_augmentation(d, "drop_node", 0.2) for d in data_list]
-            batch2 = [graph_augmentation(d, "drop_edge", 0.2) for d in data_list]
+            # Use different seeds for different augmentations to ensure variety
+            batch1 = [graph_augmentation(d, "drop_node", 0.2, seed=42+i) for i, d in enumerate(data_list)]
+            batch2 = [graph_augmentation(d, "drop_edge", 0.2, seed=100+i) for i, d in enumerate(data_list)]
 
             batch1 = Batch.from_data_list(batch1)
             batch2 = Batch.from_data_list(batch2)
@@ -236,10 +264,17 @@ fold_splits = get_kfold_splits(dataset, num_folds=opt.num_folds)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+# Ensure model creation is deterministic
+set_random_seeds(42)
 encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, output_dim=256, dropout=0.5, 
-                           use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio, layer_type=opt.layer_type).to(device)
+                           use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio, layer_type=opt.layer_type,
+                           num_layers=opt.gnn_num_layers, activation=opt.gnn_activation).to(device)
 
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
+
+# Ensure all pretraining operations are deterministic
+set_random_seeds(42)
+
 if hasattr(opt, 'pretrain_encoder') and opt.pretrain_encoder:
     if hasattr(opt, 'use_pretrained') and opt.use_pretrained and os.path.exists(pretrained_path):
         encoder.load_state_dict_flexible(torch.load(pretrained_path))
@@ -288,6 +323,9 @@ for fold, split in enumerate(fold_splits):
     # MODEL SETUP FOR THIS FOLD
     ###################
 
+    # Ensure deterministic model copying and creation
+    set_random_seeds(42)
+    
     # Create a fresh copy of the encoder for this fold
     fold_encoder = copy.deepcopy(encoder).to(device)   # perfect architectural match
 
@@ -296,16 +334,19 @@ for fold, split in enumerate(fold_splits):
             p.requires_grad = False
         print("GNN encoder frozen for transfer learning.")
 
-    # Create temporal data loaders
+    # Create temporal data loaders with consistent seeded randomness
     train_loader = TemporalDataLoader(dataset, tr_index, fold_encoder, device, 
-                                    batch_size=opt.batch_size, shuffle=True)
+                                    batch_size=opt.batch_size, shuffle=True, seed=42)
     val_loader = TemporalDataLoader(dataset, val_index, fold_encoder, device,
-                                batch_size=opt.batch_size, shuffle=False)
+                                batch_size=opt.batch_size, shuffle=False, seed=42)
     test_loader = TemporalDataLoader(dataset, te_index, fold_encoder, device,
-                                batch_size=opt.batch_size, shuffle=False)
+                                batch_size=opt.batch_size, shuffle=False, seed=42)
     
     print(f"Processing {len(train_loader)} temporal sequence batches per epoch")
 
+    # Ensure deterministic classifier initialization
+    set_random_seeds(42)
+    
     if(opt.model_type == "LSTM"):
         classifier = TemporalTabGNNClassifier(
             graph_emb_dim=512,
@@ -337,6 +378,9 @@ for fold, split in enumerate(fold_splits):
             num_classes=2
         ).to(device)
 
+    # Ensure deterministic optimizer initialization
+    set_random_seeds(42)
+    
     # Optimizer with different learning rates for different components
     encoder_params = list(fold_encoder.parameters())
     classifier_params = list(classifier.parameters())
@@ -463,6 +507,7 @@ for fold, split in enumerate(fold_splits):
     train_results = {'accuracy': 0.0, 'balanced_accuracy': 0.0}
 
     for epoch in range(1, opt.n_epochs + 1):
+        
         fold_encoder.train()
         classifier.train()
         
@@ -576,6 +621,17 @@ for fold, split in enumerate(fold_splits):
                                 target_names=['Stable', 'Converter'],
                                 zero_division=0))
 
+    # Conversion-specific accuracy analysis
+    label_csv_path = os.path.join("/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data", "TADPOLE_Simplified.csv")
+    conversion_results = analyze_conversion_predictions(
+        test_subjects, 
+        test_results['predictions'], 
+        test_results['targets'], 
+        label_csv_path
+    )
+    print_conversion_accuracy_report(conversion_results)
+    fold_conversion_results.append(conversion_results)
+
     fold_results['test_acc'].append(test_results['accuracy'])
     fold_results['balanced_acc'].append(test_results['balanced_accuracy'])
     fold_results['minority_f1'].append(test_results['minority_f1'])
@@ -591,3 +647,11 @@ for metric, values in fold_results.items():
         print(f"{metric}: {mean:.3f} ± {std:.3f}")
     else:
         print(f"{metric}: No data collected")
+
+# Aggregated conversion-specific accuracy analysis
+if fold_conversion_results:
+    print("\n" + "="*60)
+    print("AGGREGATED CONVERSION ACCURACY ACROSS ALL FOLDS")
+    print("="*60)
+    aggregated_conversion_results = aggregate_conversion_results(fold_conversion_results)
+    print_conversion_accuracy_report(aggregated_conversion_results)

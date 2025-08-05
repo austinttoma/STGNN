@@ -11,33 +11,57 @@ from torch_geometric.nn import (
 from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 class GraphNeuralNetwork(nn.Module):
     def __init__(self, input_dim=100, hidden_dim=128, output_dim=256, dropout=0.5, 
-                 use_topk_pooling=True, topk_ratio=0.5, layer_type):
+                 use_topk_pooling=True, topk_ratio=0.5, layer_type="GCN", 
+                 num_layers=3, activation='relu'):
         super(GraphNeuralNetwork, self).__init__()
 
         self.use_topk_pooling = use_topk_pooling
         self.topk_ratio = topk_ratio
-
-        if layer_type == "GCN":
-            self.conv1 = GCNConv(input_dim, hidden_dim)
-            self.conv2 = GCNConv(hidden_dim, hidden_dim)
-            self.conv3 = GCNConv(hidden_dim, output_dim)
-        elif layer_type == "GAT":
-            self.conv1 = GATConv(input_dim, hidden_dim)
-            self.conv2 = GATConv(hidden_dim, hidden_dim)
-            self.conv3 = GATConv(hidden_dim, output_dim)
-        elif layer_type == "GraphSAGE":
-            self.conv1 = SAGEConv(input_dim, hidden_dim)
-            self.conv2 = SAGEConv(hidden_dim, hidden_dim)
-            self.conv3 = SAGEConv(hidden_dim, output_dim)
-
-        else:
-            raise ValueError(f"Unknown layer type: {layer_type}")
+        self.num_layers = num_layers
+        self.layer_type = layer_type
+        self.hidden_dim = hidden_dim
+        self.output_dim = output_dim
         
+        # Set up activation function
+        activation_map = {
+            'relu': F.relu,
+            'leaky_relu': F.leaky_relu,
+            'elu': F.elu,
+            'gelu': F.gelu
+        }
+        self.activation_fn = activation_map.get(activation, F.relu)
         
-        # Graph normalization layers (per-graph stats)
-        self.gn1 = GraphNorm(hidden_dim)
-        self.gn2 = GraphNorm(hidden_dim)
-        self.gn3 = GraphNorm(output_dim)
+        # Build dynamic layer architecture
+        self.convs = nn.ModuleList()
+        self.gns = nn.ModuleList()
+        
+        # Create layers dynamically
+        for i in range(num_layers):
+            if i == 0:
+                # First layer: input_dim -> hidden_dim
+                in_dim = input_dim
+                out_dim = hidden_dim
+            elif i == num_layers - 1:
+                # Last layer: hidden_dim -> output_dim
+                in_dim = hidden_dim
+                out_dim = output_dim
+            else:
+                # Middle layers: hidden_dim -> hidden_dim
+                in_dim = hidden_dim
+                out_dim = hidden_dim
+            
+            # Create layer based on type
+            if layer_type == "GCN":
+                conv = GCNConv(in_dim, out_dim)
+            elif layer_type == "GAT":
+                conv = GATConv(in_dim, out_dim)
+            elif layer_type == "GraphSAGE":
+                conv = SAGEConv(in_dim, out_dim)
+            else:
+                raise ValueError(f"Unknown layer type: {layer_type}")
+            
+            self.convs.append(conv)
+            self.gns.append(GraphNorm(out_dim))
         
         # Dropout
         self.dropout = nn.Dropout(p=dropout)
@@ -46,10 +70,19 @@ class GraphNeuralNetwork(nn.Module):
         if use_topk_pooling:
             # Ensure minimum 30% of nodes are retained at each layer to prevent empty graphs
             safe_ratio = max(0.3, min(1.0, topk_ratio))
-            self.topk_pool1 = TopKPooling(hidden_dim, ratio=safe_ratio, min_score=None)
-            self.topk_pool2 = TopKPooling(hidden_dim, ratio=safe_ratio, min_score=None) 
-            self.topk_pool3 = TopKPooling(output_dim, ratio=safe_ratio, min_score=None)
-            print(f"TopK pooling initialized with safe ratio: {safe_ratio} (minimum 30%)")
+            self.topk_pools = nn.ModuleList()
+            
+            for i in range(num_layers):
+                if i == num_layers - 1:
+                    # Last layer uses output_dim
+                    pool_dim = output_dim
+                else:
+                    # Other layers use hidden_dim
+                    pool_dim = hidden_dim
+                
+                self.topk_pools.append(TopKPooling(pool_dim, ratio=safe_ratio, min_score=None))
+            
+            print(f"TopK pooling initialized with {num_layers} layers, safe ratio: {safe_ratio} (minimum 30%)")
         
         # Traditional pooling ops as fallback
         self.pool_mean = global_mean_pool
@@ -62,32 +95,16 @@ class GraphNeuralNetwork(nn.Module):
             return self._forward_traditional(x, edge_index, batch)
     
     def _forward_with_topk(self, x, edge_index, batch):
-        # First GCN layer
-        x = self.conv1(x, edge_index)
-        x = self.gn1(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
-        
-        # First TopK pooling - keep top nodes
-        x, edge_index, _, batch, perm, score = self.topk_pool1(x, edge_index, batch=batch)
-        
-        # Second GCN layer
-        x = self.conv2(x, edge_index)
-        x = self.gn2(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
-        
-        # Second TopK pooling
-        x, edge_index, _, batch, perm, score = self.topk_pool2(x, edge_index, batch=batch)
-        
-        # Third GCN layer  
-        x = self.conv3(x, edge_index)
-        x = self.gn3(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
-        
-        # Final TopK pooling
-        x, edge_index, _, batch, perm, score = self.topk_pool3(x, edge_index, batch=batch)
+        # Dynamic forward pass through all layers with TopK pooling
+        for i in range(self.num_layers):
+            # Apply convolution
+            x = self.convs[i](x, edge_index)
+            x = self.gns[i](x, batch)
+            x = self.activation_fn(x)
+            x = self.dropout(x)
+            
+            # Apply TopK pooling after each layer
+            x, edge_index, _, batch, perm, score = self.topk_pools[i](x, edge_index, batch=batch)
         
         # Global pooling on the remaining top nodes
         x_mean = self.pool_mean(x, batch)
@@ -99,23 +116,13 @@ class GraphNeuralNetwork(nn.Module):
         return x
     
     def _forward_traditional(self, x, edge_index, batch):
-        # First GCN layer
-        x = self.conv1(x, edge_index)
-        x = self.gn1(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
-        
-        # Second GCN layer
-        x = self.conv2(x, edge_index)
-        x = self.gn2(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
-        
-        # Third GCN layer
-        x = self.conv3(x, edge_index)
-        x = self.gn3(x, batch)
-        x = F.relu(x)
-        x = self.dropout(x)
+        # Dynamic forward pass through all layers without TopK pooling
+        for i in range(self.num_layers):
+            # Apply convolution
+            x = self.convs[i](x, edge_index)
+            x = self.gns[i](x, batch)
+            x = self.activation_fn(x)
+            x = self.dropout(x)
         
         # Combine mean and max pooling for richer representation
         x_mean = self.pool_mean(x, batch)

@@ -6,23 +6,14 @@ from scipy.io import loadmat
 from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
 import pandas as pd
-
-from sklearn.model_selection import train_test_split
 import random
-import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
 
 def stratified_subject_split(subject_label_dict, seed=123):
-    """
-    Performs stratified splitting of subjects into train (70%), val (10%), and test (20%) groups.
-    Keeps all visits from the same subject in one group.
+    random.seed(seed)
+    np.random.seed(seed)
     
-    Args:
-        subject_label_dict (dict): Mapping of subject_id -> label (0 or 1)
-        seed (int): Random seed for reproducibility
-
-    Returns:
-        train_subjects, val_subjects, test_subjects (lists of subject IDs)
-    """
     # Convert to DataFrame for easier manipulation
     df = pd.DataFrame(list(subject_label_dict.items()), columns=['subject_id', 'label'])
 
@@ -40,17 +31,19 @@ def stratified_subject_split(subject_label_dict, seed=123):
 
     return list(train_df['subject_id']), list(val_df['subject_id']), list(test_df['subject_id'])
 
-def train_val_test_split(kfold = 5, fold = 0, dataset_size = 1089):
+def train_val_test_split(kfold = 5, fold = 0, dataset_size = 1089, seed=123):
     n_sub = dataset_size
     id = list(range(n_sub))
 
-
+    # Set all random seeds for reproducibility
     import random
-    random.seed(123)
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
     random.shuffle(id)
 
-    kf = KFold(n_splits=kfold, random_state=123,shuffle = True)
-    kf2 = KFold(n_splits=kfold-1, shuffle=True, random_state = 666)
+    kf = KFold(n_splits=kfold, random_state=seed, shuffle=True)
+    kf2 = KFold(n_splits=kfold-1, shuffle=True, random_state=seed+1)
 
 
     test_index = list()

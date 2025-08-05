@@ -9,20 +9,23 @@ class TemporalDataLoader:
     Groups graphs by subject and creates padded sequences for LSTM processing.
     """
     
-    def __init__(self, dataset, subject_indices, encoder, device, batch_size=8, shuffle=True):
+    def __init__(self, dataset, subject_indices, encoder, device, batch_size=8, shuffle=True, seed=42):
         self.dataset = dataset
         self.subject_indices = subject_indices
         self.encoder = encoder
         self.device = device
         self.batch_size = batch_size
         self.shuffle = shuffle
+        self.seed = seed
         
         # Group indices by subject
         self.subject_data = self._group_by_subject()
         self.subjects = list(self.subject_data.keys())
         
         if self.shuffle:
-            np.random.shuffle(self.subjects)
+            # Use seeded randomness for reproducible shuffling
+            rng = np.random.RandomState(self.seed)
+            rng.shuffle(self.subjects)
     
     def _group_by_subject(self):
         """Group dataset indices by subject ID."""
@@ -59,7 +62,9 @@ class TemporalDataLoader:
     def __iter__(self):
         """Iterate over temporal sequences in batches with batched embedding computation."""
         if self.shuffle:
-            np.random.shuffle(self.subjects)
+            # Use seeded randomness for reproducible shuffling each epoch
+            rng = np.random.RandomState(self.seed)
+            rng.shuffle(self.subjects)
         
         for i in range(0, len(self.subjects), self.batch_size):
             batch_subjects = self.subjects[i:i + self.batch_size]
