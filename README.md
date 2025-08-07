@@ -2,22 +2,15 @@
 
 Spatiotemporal Graph Neural Network for predicting cognitive stage conversion using rs-fMRI data from ADNI.
 
-## Overview
 This project predicts Alzheimer's disease progression by combining Graph Neural Networks for brain connectivity analysis with RNNs for temporal modeling across patient visits. Best performance achieved with GraphSAGE-LSTM architecture: 67.7% test accuracy, 63.9% balanced accuracy, and 68.4% AUC.
 
 **Paper**: "The Effectiveness of using rs-fMRI for Prediction of Cognitive Impairment Stage Conversion"
-
-## Requirements
-- Python 3.8+, CUDA GPU recommended
-- Key packages: torch, torch-geometric, scikit-learn, nilearn
 
 ```bash
 pip install -r requirements.txt
 ```
 
-## Data Setup
-
-### Required Data Files
+### Data Setup
 1. **FC Matrices**: Place in `data/FC_Matrices/`
    - Format: `sub-XXXXXX_run-XX_fc_matrix.npz`
    - Each .npz file should contain a key named `fc_matrix` with the connectivity matrix
@@ -31,24 +24,22 @@ pip install -r requirements.txt
    - Created automatically if not present
    - Stores trained models and pretrained encoders
 
-### Data Preparation (if needed)
+### Data Preparation
 ```bash
 # Generate TADPOLE_TEMPORAL.csv from original TADPOLE data
 python setup_temporal_data.py
 ```
 
-## Usage
-
-### Basic Training (with default best parameters)
+### Training
 ```bash
-# Run with optimized defaults (GraphSAGE-LSTM, TopK pooling, focal loss)
+# Run with defaults (GraphSAGE-LSTM, TopK pooling, focal loss)
 python main.py
 
 # Run with time features (experimental, requires --exclude_target_visit)
 python main.py --use_time_features --exclude_target_visit
 ```
 
-### Custom Configuration
+### Configurations
 ```bash
 python main.py [options]
 
@@ -88,7 +79,7 @@ python main.py [options]
 --freeze_encoder                # Freeze encoder during temporal training
 ```
 
-## Key Files
+## Files
 - `main.py` - Training script with 5-fold cross-validation and model selection
 - `model.py` - Graph Neural Network with configurable layers (GCN/GAT/GraphSAGE) and TopK pooling
 - `TemporalPredictor.py` - LSTM-based temporal classifier for sequences
