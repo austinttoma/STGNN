@@ -7,7 +7,6 @@ from sklearn.model_selection import StratifiedKFold
 from sklearn.model_selection import KFold
 import pandas as pd
 import random
-import numpy as np
 from sklearn.model_selection import train_test_split
 
 def stratified_subject_split(subject_label_dict, seed=123):
@@ -36,8 +35,6 @@ def train_val_test_split(kfold = 5, fold = 0, dataset_size = 1089, seed=123):
     id = list(range(n_sub))
 
     # Set all random seeds for reproducibility
-    import random
-    import numpy as np
     random.seed(seed)
     np.random.seed(seed)
     random.shuffle(id)

@@ -25,41 +25,44 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size for temporal sequences (subjects per batch)')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-parser.add_argument('--focal_alpha', type=float, default=0.8, help='focal loss alpha (weight for minority class)')
-parser.add_argument('--focal_gamma', type=float, default=2.0, help='focal loss gamma (focusing parameter)')
+parser.add_argument('--focal_alpha', type=float, default=0.90, help='focal loss alpha (weight for minority class)')
+parser.add_argument('--focal_gamma', type=float, default=3.0, help='focal loss gamma (focusing parameter)')
 parser.add_argument('--label_smoothing', type=float, default=0.05, help='label smoothing factor')
 parser.add_argument('--save_path', type=str, default='./model/', help='path to save model')
 parser.add_argument('--save_model', type=bool, default=True)
-parser.add_argument('--minority_focus_epochs', type=int, default=0, help='epochs to focus on minority class')
-parser.add_argument('--lstm_hidden_dim', type=int, default=128, help='LSTM hidden dimension')
+parser.add_argument('--minority_focus_epochs', type=int, default=20, help='epochs to focus on minority class')
+parser.add_argument('--lstm_hidden_dim', type=int, default=64, help='LSTM hidden dimension')
 parser.add_argument('--lstm_num_layers', type=int, default=1, help='number of LSTM layers')
 parser.add_argument('--lstm_bidirectional', type=bool, default=True, help='use bidirectional LSTM')
 parser.add_argument('--num_folds', type=int, default=5, help='Number of CV folds (set to 1 for single fold)')
-parser.add_argument('--model_type', type=str, default='RNN', help='Which RNN Based Model is being utilized RNN, GRU, LSTM')
-parser.add_argument('--max_visits', type=int, default='10', help='How many max visits allowed for a patients visit sequence')
+parser.add_argument('--model_type', type=str, default='LSTM', help='Which RNN Based Model is being utilized RNN, GRU, LSTM')
+parser.add_argument('--max_visits', type=int, default=10, help='How many max visits allowed for a patients visit sequence')
 parser.add_argument('--pretrain_encoder', action='store_true', help='whether to pretrain GNN encoder using GraphCL')
 parser.add_argument('--pretrain_epochs', type=int, default=50, help='number of epochs for GNN self-supervised pretraining')
 parser.add_argument('--freeze_encoder', action='store_true', help='whether to freeze GNN encoder during temporal training')
 parser.add_argument('--use_pretrained', action='store_true', help='use an existing pretrained encoder if it is on disk')
 parser.add_argument('--use_topk_pooling', action='store_true', default=True, help='use TopK pooling instead of global pooling')
-parser.add_argument('--topk_ratio', type=float, default=0.5, help='TopK pooling ratio (fraction of nodes to keep)')
-parser.add_argument('--layer_type', type=str, default="GCN", help='GNN layer type: GCN, GAT, or GraphSAGE')
-parser.add_argument('--gnn_hidden_dim', type=int, default=128, help='GNN hidden dimension size')
-parser.add_argument('--gnn_num_layers', type=int, default=3, help='number of GNN layers (2-5)')
-parser.add_argument('--gnn_activation', type=str, default='relu', help='GNN activation function: relu, leaky_relu, elu, gelu')
+parser.add_argument('--topk_ratio', type=float, default=0.3, help='TopK pooling ratio (fraction of nodes to keep)')
+parser.add_argument('--layer_type', type=str, default="GraphSAGE", help='GNN layer type: GCN, GAT, or GraphSAGE')
+parser.add_argument('--gnn_hidden_dim', type=int, default=256, help='GNN hidden dimension size')
+parser.add_argument('--gnn_num_layers', type=int, default=2, help='number of GNN layers (2-5)')
+parser.add_argument('--gnn_activation', type=str, default='elu', help='GNN activation function: relu, leaky_relu, elu, gelu')
+parser.add_argument('--use_time_features', action='store_true', help='use temporal gap features for time-aware prediction')
+parser.add_argument('--exclude_target_visit', action='store_true', help='exclude target visit from input sequences (prevent data leakage)')
+parser.add_argument('--time_normalization', type=str, default='log', help='time normalization method: log, minmax, buckets, raw')
+parser.add_argument('--single_visit_horizon', type=int, default=6, help='default prediction horizon (months) for single-visit subjects')
 
 opt = parser.parse_args()
 
 def set_random_seeds(seed=42):
-      """Set all random seeds for reproducibility"""
-
-      random.seed(seed)
-      np.random.seed(seed)
-      torch.manual_seed(seed)
-      torch.cuda.manual_seed(seed)
-      torch.cuda.manual_seed_all(seed)
-      torch.backends.cudnn.deterministic = True
-      torch.backends.cudnn.benchmark = False
+    """Set all random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 set_random_seeds(42)
 
@@ -268,7 +271,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 set_random_seeds(42)
 encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, output_dim=256, dropout=0.5, 
                            use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio, layer_type=opt.layer_type,
-                           num_layers=opt.gnn_num_layers, activation=opt.gnn_activation).to(device)
+                           num_layers=opt.gnn_num_layers, activation=opt.gnn_activation, 
+                           use_time_features=opt.use_time_features).to(device)
 
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
 
@@ -336,11 +340,20 @@ for fold, split in enumerate(fold_splits):
 
     # Create temporal data loaders with consistent seeded randomness
     train_loader = TemporalDataLoader(dataset, tr_index, fold_encoder, device, 
-                                    batch_size=opt.batch_size, shuffle=True, seed=42)
+                                    batch_size=opt.batch_size, shuffle=True, seed=42,
+                                    exclude_target_visit=opt.exclude_target_visit,
+                                    time_normalization=opt.time_normalization,
+                                    single_visit_horizon=opt.single_visit_horizon)
     val_loader = TemporalDataLoader(dataset, val_index, fold_encoder, device,
-                                batch_size=opt.batch_size, shuffle=False, seed=42)
+                                batch_size=opt.batch_size, shuffle=False, seed=42,
+                                exclude_target_visit=opt.exclude_target_visit,
+                                time_normalization=opt.time_normalization,
+                                single_visit_horizon=opt.single_visit_horizon)
     test_loader = TemporalDataLoader(dataset, te_index, fold_encoder, device,
-                                batch_size=opt.batch_size, shuffle=False, seed=42)
+                                batch_size=opt.batch_size, shuffle=False, seed=42,
+                                exclude_target_visit=opt.exclude_target_visit,
+                                time_normalization=opt.time_normalization,
+                                single_visit_horizon=opt.single_visit_horizon)
     
     print(f"Processing {len(train_loader)} temporal sequence batches per epoch")
 
@@ -425,6 +438,7 @@ for fold, split in enumerate(fold_splits):
                 graph_seq = batch['graph_seq']
                 lengths = batch['lengths'] 
                 labels = batch['labels']
+                time_gaps = batch.get('time_gaps', None)
                 
                 logits = classifier(graph_seq, None, lengths)
                 loss = criterion(logits, labels)
@@ -472,6 +486,88 @@ for fold, split in enumerate(fold_splits):
         
         return result
 
+    def evaluate_by_horizon(loader):
+        """Evaluate model performance grouped by prediction time horizon."""
+        if not opt.use_time_features:
+            return None
+            
+        fold_encoder.eval()
+        classifier.eval()
+        
+        # Define time horizon buckets (in normalized log scale)
+        # log(1 + months/12): 0-6m→0.35, 6-12m→0.69, 12-24m→1.1, 24m+→>1.1
+        horizons = {
+            '0-6m': {'range': (0, 0.5), 'preds': [], 'targets': [], 'probs': []},
+            '6-12m': {'range': (0.5, 0.8), 'preds': [], 'targets': [], 'probs': []},
+            '12-24m': {'range': (0.8, 1.2), 'preds': [], 'targets': [], 'probs': []},
+            '24m+': {'range': (1.2, float('inf')), 'preds': [], 'targets': [], 'probs': []}
+        }
+        
+        with torch.no_grad():
+            for batch in loader:
+                graph_seq = batch['graph_seq']
+                lengths = batch['lengths']
+                labels = batch['labels']
+                time_gaps = batch.get('time_gaps', None)
+                
+                if time_gaps is None:
+                    continue
+                    
+                logits = classifier(graph_seq, None, lengths)
+                probs = F.softmax(logits, dim=1)
+                preds = logits.argmax(dim=1)
+                
+                # Group predictions by time horizon
+                for i in range(len(time_gaps)):
+                    gap = time_gaps[i].item()
+                    pred = preds[i].item()
+                    target = labels[i].item()
+                    prob = probs[i].cpu().numpy()
+                    
+                    # Find appropriate bucket
+                    for horizon_name, horizon_data in horizons.items():
+                        if horizon_data['range'][0] <= gap < horizon_data['range'][1]:
+                            horizon_data['preds'].append(pred)
+                            horizon_data['targets'].append(target)
+                            horizon_data['probs'].append(prob)
+                            break
+        
+        # Calculate metrics for each horizon
+        results = {}
+        for horizon_name, horizon_data in horizons.items():
+            if len(horizon_data['preds']) > 0:
+                preds = np.array(horizon_data['preds'])
+                targets = np.array(horizon_data['targets'])
+                probs = np.array(horizon_data['probs'])
+                
+                accuracy = np.mean(preds == targets)
+                
+                # Calculate per-class metrics
+                precision, recall, f1, _ = precision_recall_fscore_support(
+                    targets, preds, average=None, zero_division=0
+                )
+                
+                # Calculate AUC if both classes present
+                try:
+                    auc = roc_auc_score(targets, probs[:, 1])
+                except:
+                    auc = 0.0
+                
+                results[horizon_name] = {
+                    'count': len(preds),
+                    'accuracy': accuracy,
+                    'minority_f1': f1[1] if len(f1) > 1 else 0,
+                    'auc': auc
+                }
+            else:
+                results[horizon_name] = {
+                    'count': 0,
+                    'accuracy': 0,
+                    'minority_f1': 0,
+                    'auc': 0
+                }
+        
+        return results
 
     def minority_class_forcing_loss(logits, targets, epoch):
         """
@@ -526,6 +622,7 @@ for fold, split in enumerate(fold_splits):
             graph_seq = batch['graph_seq']
             lengths = batch['lengths'] 
             labels = batch['labels']
+            time_gaps = batch.get('time_gaps', None)
             
             logits = classifier(graph_seq, None, lengths)
             
@@ -620,6 +717,18 @@ for fold, split in enumerate(fold_splits):
     print(classification_report(test_results['targets'], test_results['predictions'],
                                 target_names=['Stable', 'Converter'],
                                 zero_division=0))
+    
+    # Horizon-based evaluation only IF using time features
+    if opt.use_time_features:
+        print("\n" + "="*50)
+        print("By horizon:")
+        horizon_results = evaluate_by_horizon(test_loader)
+        if horizon_results:
+            for horizon, metrics in horizon_results.items():
+                if metrics['count'] > 0:
+                    print(f"{horizon}: n={metrics['count']}, Acc={metrics['accuracy']:.3f}, F1={metrics['minority_f1']:.3f}")
+                else:
+                    print(f"{horizon}: none")
 
     # Conversion-specific accuracy analysis
     label_csv_path = os.path.join("/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data", "TADPOLE_Simplified.csv")

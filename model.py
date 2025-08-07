@@ -3,16 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import (
     GCNConv,
+    GATConv,
+    SAGEConv,
     GraphNorm,
     global_mean_pool,
     global_max_pool,
     TopKPooling,
 )
-from torch_geometric.nn import GCNConv, GATConv, SAGEConv
 class GraphNeuralNetwork(nn.Module):
     def __init__(self, input_dim=100, hidden_dim=128, output_dim=256, dropout=0.5, 
                  use_topk_pooling=True, topk_ratio=0.5, layer_type="GCN", 
-                 num_layers=3, activation='relu'):
+                 num_layers=3, activation='relu', use_time_features=False):
         super(GraphNeuralNetwork, self).__init__()
 
         self.use_topk_pooling = use_topk_pooling
@@ -21,6 +22,7 @@ class GraphNeuralNetwork(nn.Module):
         self.layer_type = layer_type
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
+        self.use_time_features = use_time_features
         
         # Set up activation function
         activation_map = {
@@ -87,12 +89,49 @@ class GraphNeuralNetwork(nn.Module):
         # Traditional pooling ops as fallback
         self.pool_mean = global_mean_pool
         self.pool_max = global_max_pool
+        
+        # Time feature projection layer if using time features
+        if self.use_time_features:
+            # Project time feature to match output dimension
+            # Note: final GNN output is actually output_dim*2 due to mean+max pooling
+            final_output_dim = output_dim * 2
+            # Much smaller time projection to prevent dominance over graph features
+            time_dim = 32  # Small dimension for time features
+            self.time_projection = nn.Sequential(
+                nn.Linear(1, 16),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(16, time_dim)
+            )
+            # Weighted fusion layer - graph features get more weight than time features
+            self.fusion_layer = nn.Sequential(
+                nn.Linear(final_output_dim + time_dim, final_output_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, time_to_predict=None):
         if self.use_topk_pooling:
-            return self._forward_with_topk(x, edge_index, batch)
+            graph_embedding = self._forward_with_topk(x, edge_index, batch)
         else:
-            return self._forward_traditional(x, edge_index, batch)
+            graph_embedding = self._forward_traditional(x, edge_index, batch)
+        
+        # If using time features, combine them with graph embedding
+        if self.use_time_features and time_to_predict is not None:
+            # time_to_predict is [B] or [B, 1], ensure it's [B, 1]
+            if len(time_to_predict.shape) == 1:
+                time_to_predict = time_to_predict.unsqueeze(1)
+            
+            # Project time feature to smaller dimension
+            time_embedding = self.time_projection(time_to_predict)  # [B, time_dim=32]
+            
+            # Concatenate graph (512D) + time (32D) = 544D total
+            combined = torch.cat([graph_embedding, time_embedding], dim=1)  # [B, final_output_dim + time_dim]
+            final_embedding = self.fusion_layer(combined)  # [B, final_output_dim]
+            
+            return final_embedding
+        else:
+            return graph_embedding
     
     def _forward_with_topk(self, x, edge_index, batch):
         # Dynamic forward pass through all layers with TopK pooling
