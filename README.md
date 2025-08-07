@@ -25,7 +25,7 @@ pip install -r requirements.txt
 2. **Patient Labels**: `data/TADPOLE_TEMPORAL.csv`
    - Required columns: `Subject`, `Visit`, `Label_CS_Num`, `Visit_Order`, `Months_From_Baseline`, `Months_To_Next_Original`
    - Labels: 0=Stable, 1=Converter
-   - Can be generated from TADPOLE data using `setup_temporal_data.py`
+   - Can be generated from TADPOLE_Simplified.csv and TADPOLE_COMPLETE.csv using `setup_temporal_data.py`
 
 3. **Output Directory**: `model/` 
    - Created automatically if not present
