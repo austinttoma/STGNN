@@ -208,6 +208,7 @@ class TemporalDataLoader:
             # Compute all embeddings in one forward pass
             self.encoder.eval()
             with torch.no_grad():
+                # Both encoders now accept time_features parameter (DynamicGraphNeuralNetwork ignores it)
                 all_embeddings = self.encoder(big_batch.x, big_batch.edge_index, big_batch.batch, time_features_tensor)
             
             # Reshape embeddings back into per-subject sequences
