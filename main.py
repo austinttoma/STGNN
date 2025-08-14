@@ -373,7 +373,7 @@ for fold, split in enumerate(fold_splits):
             tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
-            dropout=0.2,
+            dropout=0.45,
             bidirectional=opt.lstm_bidirectional,
             num_classes=2
         ).to(device)
@@ -383,7 +383,7 @@ for fold, split in enumerate(fold_splits):
             tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
-            dropout=0.2,
+            dropout=0.45,
             bidirectional=False,
             num_classes=2
         ).to(device)
@@ -393,7 +393,7 @@ for fold, split in enumerate(fold_splits):
             tab_emb_dim=0,
             hidden_dim=opt.lstm_hidden_dim,
             num_layers=opt.lstm_num_layers,
-            dropout=0.2,
+            dropout=0.45,
             bidirectional=False,
             num_classes=2
         ).to(device)
@@ -408,7 +408,7 @@ for fold, split in enumerate(fold_splits):
     optimizer = torch.optim.Adam([
         {'params': encoder_params, 'lr': opt.lr},
         {'params': classifier_params, 'lr': opt.lr}
-    ], betas=(0.9, 0.999))
+    ], betas=(0.9, 0.999), weight_decay=1e-4)
 
     # Scheduler - simplified for better convergence
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(

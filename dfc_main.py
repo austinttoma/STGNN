@@ -368,23 +368,23 @@ for fold, split in enumerate(fold_splits, start=1):
     graph_emb_dim = fold_encoder.output_dim * 2  # mean+max pooling
     if opt.model_type == "LSTM":
         classifier = TemporalTabGNNClassifier(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                              opt.lstm_num_layers, dropout=0.5,
+                                              opt.lstm_num_layers, dropout=0.45,
                                               bidirectional=opt.lstm_bidirectional,
                                               num_classes=2).to(device)
     elif opt.model_type == "GRU":
         classifier = GRUPredictor(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                  opt.lstm_num_layers, dropout=0.5,
+                                  opt.lstm_num_layers, dropout=0.45,
                                   bidirectional=False, num_classes=2).to(device)
     else:
         classifier = RNNPredictor(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                  opt.lstm_num_layers, dropout=0.5,
+                                  opt.lstm_num_layers, dropout=0.45,
                                   bidirectional=False, num_classes=2).to(device)
 
     set_random_seeds(42)
     optimizer = torch.optim.Adam([
         {'params': fold_encoder.parameters(), 'lr': opt.lr * 0.5},
         {'params': classifier.parameters(), 'lr': opt.lr}
-    ])
+    ], weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
     criterion = FocalLoss(alpha=opt.focal_alpha, gamma=opt.focal_gamma, label_smoothing=opt.label_smoothing)
 
