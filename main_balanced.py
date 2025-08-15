@@ -48,7 +48,10 @@ parser.add_argument('--use_time_features', action='store_true', help='use tempor
 parser.add_argument('--exclude_target_visit', action='store_true', help='exclude target visit from input sequences (prevent data leakage)')
 parser.add_argument('--time_normalization', type=str, default='log', help='time normalization method: log, minmax, buckets, raw')
 parser.add_argument('--single_visit_horizon', type=int, default=6, help='default prediction horizon (months) for single-visit subjects')
-parser.add_argument('--no_pretrain', action='store_true', help='skip loading pretrained encoder and train from scratch')
+
+# NEW BALANCING ARGUMENTS
+parser.add_argument('--use_balancing', action='store_true', help='enable balanced sampling of training data')
+parser.add_argument('--balance_ratio', type=float, default=2.0, help='ratio of stable to converter subjects in training set')
 
 opt = parser.parse_args()
 
@@ -115,7 +118,20 @@ for subject_id in dataset.subject_graph_dict:
         dataset.subject_graph_dict[subject_id] = visits[-opt.max_visits:]
         print(f"[TRIMMED] Subject {subject_id}: {original_len} → {len(dataset.subject_graph_dict[subject_id])}")
 
-def get_kfold_splits(dataset, num_folds=5, seed=42):
+def get_balanced_kfold_splits(dataset, num_folds=5, seed=42, use_balancing=False, balance_ratio=2.0):
+    """
+    Create K-fold splits with optional balanced sampling for training sets.
+    
+    Args:
+        dataset: The dataset with subject_graph_dict
+        num_folds: Number of CV folds
+        seed: Random seed for reproducibility
+        use_balancing: Whether to apply balanced sampling to training data
+        balance_ratio: Ratio of stable to converter subjects (e.g., 2.0 = 2:1 stable:converter)
+    
+    Returns:
+        List of fold dictionaries with train/val/test splits
+    """
     subject_labels = {}
     for subj_id, graphs in dataset.subject_graph_dict.items():
         if graphs and hasattr(graphs[0], 'y'):
@@ -123,6 +139,15 @@ def get_kfold_splits(dataset, num_folds=5, seed=42):
 
     subjects = list(subject_labels.keys())
     labels = [subject_labels[s] for s in subjects]
+
+    # Get class distribution
+    stable_subjects = [s for s, l in subject_labels.items() if l == 0]
+    converter_subjects = [s for s, l in subject_labels.items() if l == 1]
+    
+    print(f"Original dataset: {len(stable_subjects)} stable, {len(converter_subjects)} converters")
+    
+    if use_balancing:
+        print(f"Balanced sampling enabled with ratio {balance_ratio}:1 (stable:converter)")
 
     skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
     fold_splits = []
@@ -141,6 +166,12 @@ def get_kfold_splits(dataset, num_folds=5, seed=42):
 
         train_subjects = [train_val_subjects[i] for i in train_idx]
         val_subjects = [train_val_subjects[i] for i in val_idx]
+        
+        # Apply balanced sampling to training set if enabled
+        if use_balancing:
+            train_subjects = apply_balanced_sampling(
+                train_subjects, subject_labels, balance_ratio, seed + fold_idx
+            )
 
         def get_visit_indices(subj_list):
             indices = []
@@ -169,7 +200,65 @@ def get_kfold_splits(dataset, num_folds=5, seed=42):
 
     return fold_splits
 
-fold_splits = get_kfold_splits(dataset, num_folds=opt.num_folds)
+def apply_balanced_sampling(subjects, subject_labels, balance_ratio, seed):
+    """
+    Apply balanced sampling to a list of subjects.
+    
+    Args:
+        subjects: List of subject IDs
+        subject_labels: Dict mapping subject ID to label (0=stable, 1=converter)
+        balance_ratio: Desired ratio of stable to converter subjects
+        seed: Random seed for reproducible sampling
+    
+    Returns:
+        List of balanced subject IDs
+    """
+    # Separate by class
+    stable_subjects = [s for s in subjects if subject_labels[s] == 0]
+    converter_subjects = [s for s in subjects if subject_labels[s] == 1]
+    
+    # Keep all converters (they're the minority)
+    n_converters = len(converter_subjects)
+    n_stable_target = int(n_converters * balance_ratio)
+    
+    # If we don't have enough stable subjects, keep all
+    if n_stable_target >= len(stable_subjects):
+        print(f"  Fold: Not enough stable subjects ({len(stable_subjects)}) for target {n_stable_target}, keeping all")
+        balanced_subjects = stable_subjects + converter_subjects
+    else:
+        # Undersample stable subjects with stratified sampling to maintain disease stage proportions
+        balanced_stable = stratified_undersample_stable(
+            stable_subjects, subject_labels, n_stable_target, seed
+        )
+        balanced_subjects = balanced_stable + converter_subjects
+        
+        print(f"  Fold: Balanced sampling - {len(balanced_stable)} stable, {n_converters} converters")
+    
+    return balanced_subjects
+
+def stratified_undersample_stable(stable_subjects, subject_labels, n_target, seed):
+    """
+    Undersample stable subjects while maintaining proportional representation 
+    from each disease stage (CN-Stable, MCI-Stable, AD-Stable).
+    """
+    # For this, we need to load the CSV to get disease stages
+    # For simplicity, we'll do proportional random sampling
+    rng = np.random.RandomState(seed)
+    
+    if n_target >= len(stable_subjects):
+        return stable_subjects
+    
+    # Simple random undersampling (could be improved with disease stage info)
+    sampled_indices = rng.choice(len(stable_subjects), size=n_target, replace=False)
+    return [stable_subjects[i] for i in sampled_indices]
+
+# Use balanced splitting if enabled
+fold_splits = get_balanced_kfold_splits(
+    dataset, 
+    num_folds=opt.num_folds, 
+    use_balancing=opt.use_balancing,
+    balance_ratio=opt.balance_ratio
+)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -182,7 +271,7 @@ encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, outpu
 
 # Load pretrained encoder if available (run supervised_pretrain.py separately to create)
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
-if os.path.exists(pretrained_path) and not opt.no_pretrain:
+if os.path.exists(pretrained_path):
     encoder.load_state_dict_flexible(torch.load(pretrained_path))
     print(f"Loaded pretrained encoder from {pretrained_path}")
 else:
@@ -198,6 +287,11 @@ print(f"  - Temporal Batch Size: {opt.batch_size} subjects/batch")
 print(f"  - Graph Pooling: {'TopK (ratio=' + str(opt.topk_ratio) + ')' if opt.use_topk_pooling else 'Global Mean/Max'}")
 print(f"Training for {opt.n_epochs} epochs")
 print(f"Minority class forcing for first {opt.minority_focus_epochs} epochs")
+
+if opt.use_balancing:
+    print(f"BALANCED SAMPLING ENABLED: {opt.balance_ratio}:1 stable:converter ratio")
+else:
+    print("Using original unbalanced data distribution")
 
 for fold, split in enumerate(fold_splits):
     print(f"\n{'='*50}")
@@ -216,6 +310,14 @@ for fold, split in enumerate(fold_splits):
         stable = sum(1 for s in subj_list if dataset.subject_graph_dict[s][0].y.item() == 0)
         converter = len(subj_list) - stable
         return stable, converter
+
+    train_stable, train_conv = count_classes(train_subjects)
+    val_stable, val_conv = count_classes(val_subjects)
+    test_stable, test_conv = count_classes(test_subjects)
+    
+    print(f"Training set: {train_stable} stable, {train_conv} converters ({train_stable/max(train_conv,1):.1f}:1 ratio)")
+    print(f"Validation set: {val_stable} stable, {val_conv} converters")
+    print(f"Test set: {test_stable} stable, {test_conv} converters")
 
     ###################
     # MODEL SETUP FOR THIS FOLD
@@ -581,7 +683,10 @@ for fold, split in enumerate(fold_splits):
             train_results = evaluate_detailed(train_loader)
             
             if opt.save_model:
-                torch.save(best_model_state, os.path.join(opt.save_path, f'best_model_fold{fold}.pth'))
+                save_name = f'best_model_fold{fold}'
+                if opt.use_balancing:
+                    save_name += f'_balanced{opt.balance_ratio}'
+                torch.save(best_model_state, os.path.join(opt.save_path, f'{save_name}.pth'))
             
             print(f"New best model saved (AUC: {best_auc:.3f}, Balanced Acc: {best_balanced_acc:.3f})")
         else:

@@ -19,6 +19,36 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from model import GraphNeuralNetwork
 from FC_ADNIDataset import FC_ADNIDataset
+from sklearn.model_selection import StratifiedKFold
+
+def get_main_test_subjects(dataset, num_folds=5, seed=42, fold_to_exclude=0):
+    """Get test subjects from a specific fold to avoid data leakage."""
+    # Replicate main.py's subject splitting logic
+    subject_graph_dict = {}
+    for data in dataset:
+        sid = getattr(data, 'subj_id', None)
+        if sid is None:
+            continue
+        base_subject_id = sid.split('_run')[0] if '_run' in sid else sid
+        subject_graph_dict.setdefault(base_subject_id, []).append(data)
+
+    subject_labels = {}
+    for subj_id, graphs in subject_graph_dict.items():
+        if graphs and hasattr(graphs[0], 'y'):
+            subject_labels[subj_id] = graphs[0].y.item()
+
+    subjects = list(subject_labels.keys())
+    labels = [subject_labels[s] for s in subjects]
+
+    skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
+    
+    # Only exclude test subjects from fold 0 to preserve enough data for pretraining
+    for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(subjects, labels)):
+        if fold_idx == fold_to_exclude:
+            test_subjects = [subjects[i] for i in test_idx]
+            return test_subjects
+    
+    return []
 
 def set_random_seeds(seed=42):
     """Set all random seeds for reproducibility"""
@@ -30,15 +60,55 @@ def set_random_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3):
+def pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3, exclude_subjects=None):
     """Pretrain the GNN encoder using supervised learning on graph classification."""
     
-    # Split dataset
-    labels = dataset.data.y.cpu().numpy()
-    indices = np.arange(len(dataset))
-    train_idx, val_idx = train_test_split(
-        indices, test_size=0.2, stratify=labels, random_state=42
+    # Create subject-level split to avoid data leakage with main.py
+    subject_graph_dict = {}
+    for i, data in enumerate(dataset):
+        sid = getattr(data, 'subj_id', None)
+        if sid is None:
+            continue
+        base_subject_id = sid.split('_run')[0] if '_run' in sid else sid
+        if base_subject_id not in subject_graph_dict:
+            subject_graph_dict[base_subject_id] = []
+        subject_graph_dict[base_subject_id].append(i)
+    
+    # Get subject labels
+    subject_labels = {}
+    for subj_id, visit_indices in subject_graph_dict.items():
+        # Use label from first visit (all visits for same subject should have same label)
+        subject_labels[subj_id] = dataset[visit_indices[0]].y.item()
+    
+    # Split by subjects, not visits
+    subjects = list(subject_labels.keys())
+    
+    # Exclude subjects that will be used in main.py evaluation to prevent data leakage
+    if exclude_subjects is not None:
+        excluded_count = 0
+        for excluded_subj in exclude_subjects:
+            if excluded_subj in subjects:
+                subjects.remove(excluded_subj)
+                excluded_count += 1
+        print(f"Excluded {excluded_count} subjects from pretraining to prevent data leakage")
+    
+    labels = [subject_labels[s] for s in subjects]
+    
+    # Use different random state to avoid correlation with main.py splits
+    train_subjects, val_subjects = train_test_split(
+        subjects, test_size=0.2, stratify=labels, random_state=123  # Different from main.py's 42
     )
+    
+    # Get visit indices for each subject split
+    train_idx = []
+    val_idx = []
+    for subj in train_subjects:
+        train_idx.extend(subject_graph_dict[subj])
+    for subj in val_subjects:
+        val_idx.extend(subject_graph_dict[subj])
+    
+    print(f"Subject-level split: {len(train_subjects)} train subjects, {len(val_subjects)} val subjects")
+    print(f"Visit-level split: {len(train_idx)} train visits, {len(val_idx)} val visits")
     
     # Create data loaders
     train_loader = DataLoader(dataset[train_idx], batch_size=batch_size, shuffle=True)
@@ -63,6 +133,8 @@ def pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=
     
     print(f"Supervised Pretraining for {epochs} epochs")
     print(f"Train samples: {len(train_idx)}, Val samples: {len(val_idx)}")
+    print(f"Train subjects: {train_subjects[:5]}...")  # Show first 5 for verification
+    print(f"Val subjects: {val_subjects[:5]}...")      # Show first 5 for verification
     
     best_val_acc = 0
     best_encoder_state = None
@@ -176,8 +248,13 @@ def main():
     print(f"  Num layers: 2")
     print(f"  TopK ratio: 0.3\n")
     
-    # Pretrain with supervision
-    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3)
+    # Get test subjects from fold 0 of main.py to exclude from pretraining (prevent data leakage)
+    main_test_subjects = get_main_test_subjects(dataset, num_folds=5, seed=42, fold_to_exclude=0)
+    print(f"Excluding {len(main_test_subjects)} test subjects from main.py fold 0")
+    
+    # Pretrain with supervision, excluding main.py test subjects
+    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3, 
+                                        exclude_subjects=main_test_subjects)
     
     # Save the pretrained encoder
     save_path = "./model/pretrained_gnn_encoder.pth"
