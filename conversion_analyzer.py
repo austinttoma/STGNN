@@ -41,18 +41,6 @@ def get_subject_conversion_type(subject_id, label_df):
     return 'Unknown'
 
 def analyze_conversion_predictions(test_subjects, predictions, targets, label_csv_path):
-    """
-    Analyze prediction accuracy broken down by conversion type.
-    
-    Args:
-        test_subjects (list): List of test subject IDs
-        predictions (list): Model predictions (0=stable, 1=converter)
-        targets (list): Ground truth labels (0=stable, 1=converter) 
-        label_csv_path (str): Path to TADPOLE_Simplified.csv
-    
-    Returns:
-        dict: Dictionary with conversion type analysis results
-    """
     # Load label data
     label_df = pd.read_csv(label_csv_path)
     label_df['Subject'] = label_df['Subject'].str.replace('_', '', regex=False)
@@ -104,19 +92,9 @@ def analyze_conversion_predictions(test_subjects, predictions, targets, label_cs
     return final_results
 
 def print_conversion_accuracy_report(conversion_results):
-    """
-    Print a formatted report of conversion prediction accuracies.
-    
-    Args:
-        conversion_results (dict): Results from analyze_conversion_predictions
-    """
-    print("\n" + "="*60)
-    print("CONVERSION-SPECIFIC PREDICTION ACCURACY ANALYSIS")
-    print("="*60)
-    
     # Show total test subjects in this fold
     total_subjects = sum(result['total_subjects'] for result in conversion_results.values())
-    print(f"Total test subjects in this fold: {total_subjects}")
+    print(f"\nTotal test subjects in this fold: {total_subjects}")
     print()
     
     # Sort conversion types for consistent reporting
@@ -147,15 +125,6 @@ def print_conversion_accuracy_report(conversion_results):
                 print(f"  Converter predictions: {result['converter_correct']}/{result['converter_total']} correct ({result['converter_accuracy']:.3f})")
 
 def aggregate_conversion_results(fold_conversion_results):
-    """
-    Aggregate conversion analysis results across multiple folds.
-    
-    Args:
-        fold_conversion_results (list): List of conversion results from each fold
-    
-    Returns:
-        dict: Aggregated results across all folds
-    """
     aggregated = defaultdict(lambda: {
         'total_subjects': 0,
         'correct_predictions': 0,

@@ -655,8 +655,5 @@ for metric, values in fold_results.items():
 
 # Aggregated conversion-specific accuracy analysis
 if fold_conversion_results:
-    print("\n" + "="*60)
-    print("AGGREGATED CONVERSION ACCURACY ACROSS ALL FOLDS")
-    print("="*60)
     aggregated_conversion_results = aggregate_conversion_results(fold_conversion_results)
     print_conversion_accuracy_report(aggregated_conversion_results)
