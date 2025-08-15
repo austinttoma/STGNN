@@ -25,8 +25,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size for temporal sequences (subjects per batch)')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-parser.add_argument('--focal_alpha', type=float, default=0.75, help='focal loss alpha (weight for minority class)')
-parser.add_argument('--focal_gamma', type=float, default=2.0, help='focal loss gamma (focusing parameter)')
+parser.add_argument('--focal_alpha', type=float, default=0.90, help='focal loss alpha (weight for minority class)')
+parser.add_argument('--focal_gamma', type=float, default=3.0, help='focal loss gamma (focusing parameter)')
 parser.add_argument('--label_smoothing', type=float, default=0.05, help='label smoothing factor')
 parser.add_argument('--save_path', type=str, default='./model/', help='path to save model')
 parser.add_argument('--save_model', type=bool, default=True)
@@ -37,10 +37,7 @@ parser.add_argument('--lstm_bidirectional', type=bool, default=True, help='use b
 parser.add_argument('--num_folds', type=int, default=5, help='Number of CV folds (set to 1 for single fold)')
 parser.add_argument('--model_type', type=str, default='LSTM', help='Which RNN Based Model is being utilized RNN, GRU, LSTM')
 parser.add_argument('--max_visits', type=int, default=10, help='How many max visits allowed for a patients visit sequence')
-parser.add_argument('--pretrain_encoder', action='store_true', help='whether to pretrain GNN encoder using GraphCL')
-parser.add_argument('--pretrain_epochs', type=int, default=50, help='number of epochs for GNN self-supervised pretraining')
 parser.add_argument('--freeze_encoder', action='store_true', help='whether to freeze GNN encoder during temporal training')
-parser.add_argument('--use_pretrained', action='store_true', help='use an existing pretrained encoder if it is on disk')
 parser.add_argument('--use_topk_pooling', action='store_true', default=True, help='use TopK pooling instead of global pooling')
 parser.add_argument('--topk_ratio', type=float, default=0.3, help='TopK pooling ratio (fraction of nodes to keep)')
 parser.add_argument('--layer_type', type=str, default="GraphSAGE", help='GNN layer type: GCN, GAT, or GraphSAGE')
@@ -84,98 +81,6 @@ fold_results = {
 
 fold_conversion_results = []
 
-###################
-# GNN PRETRAINING UTILITIES
-###################
-
-def graph_augmentation(data, aug_type="drop_node", aug_ratio=0.2, seed=None):
-    """Simple graph augmentation for GraphCL-style pretraining."""
-    data = data.clone()
-    device = data.x.device
-    
-    # Set seed for reproducible augmentation
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    if aug_type == "drop_node":
-        num_nodes = data.x.size(0)  # Use actual number of nodes from feature tensor
-        node_mask = torch.rand(num_nodes, device=device) > aug_ratio
-        data.x = data.x[node_mask]
-
-        # Remap node indices
-        new_idx = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
-        new_idx[node_mask] = torch.arange(node_mask.sum(), device=device)
-
-        # Filter and remap edges
-        edge_index = data.edge_index
-        edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
-        edge_index = edge_index[:, edge_mask]
-        edge_index = new_idx[edge_index]
-        data.edge_index = edge_index
-
-    elif aug_type == "drop_edge":
-        edge_mask = torch.rand(data.edge_index.size(1), device=device) > aug_ratio
-        data.edge_index = data.edge_index[:, edge_mask]
-    else:
-        raise ValueError("Unsupported augmentation type")
-
-    return data
-
-def nt_xent_loss(z1, z2, temperature=0.5):
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    reps = torch.cat([z1, z2], dim=0)
-    sim_matrix = torch.exp(torch.matmul(reps, reps.T) / temperature)
-
-    batch_size = z1.size(0)
-    pos_sim = torch.exp(torch.sum(z1 * z2, dim=1) / temperature)
-
-    mask = (~torch.eye(2 * batch_size, dtype=torch.bool)).to(z1.device)
-    sim_sum = sim_matrix.masked_select(mask).view(2 * batch_size, -1).sum(dim=1)
-
-    loss = -torch.log(pos_sim / (sim_sum[:batch_size] + sim_sum[batch_size:]))
-    return loss.mean()
-
-
-def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3):
-    """GraphCL-style self-supervised pretraining for the GNN encoder."""
-    encoder.train()
-    optimizer = torch.optim.Adam(encoder.parameters(), lr=lr)
-    # Create seeded generator for reproducible data loading
-    g = torch.Generator()
-    g.manual_seed(42)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                       num_workers=0, generator=g)
-
-    print(f"Pretraining GNN Encoder for {epochs} epochs (GraphCL)")
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in loader:
-            batch = batch.to(device)
-            data_list = batch.to_data_list()
-
-            # Use different seeds for different augmentations to ensure variety
-            batch1 = [graph_augmentation(d, "drop_node", 0.2, seed=42+i) for i, d in enumerate(data_list)]
-            batch2 = [graph_augmentation(d, "drop_edge", 0.2, seed=100+i) for i, d in enumerate(data_list)]
-
-            batch1 = Batch.from_data_list(batch1)
-            batch2 = Batch.from_data_list(batch2)
-
-            z1 = encoder(batch1.x, batch1.edge_index, batch1.batch)
-            z2 = encoder(batch2.x, batch2.edge_index, batch2.batch)
-
-            loss = nt_xent_loss(z1, z2)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(loader)
-        print(f"[Pretrain Epoch {epoch+1:03d}] Loss: {avg_loss:.4f}")
-
-    print("GNN Encoder Pretraining Complete.")
 
 ################## 
 # LOAD DATASET
@@ -274,28 +179,9 @@ encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, outpu
                            num_layers=opt.gnn_num_layers, activation=opt.gnn_activation, 
                            use_time_features=opt.use_time_features).to(device)
 
+# Load pretrained encoder if available (run supervised_pretrain.py separately to create)
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
-
-# Ensure all pretraining operations are deterministic
-set_random_seeds(42)
-
-if hasattr(opt, 'pretrain_encoder') and opt.pretrain_encoder:
-    if hasattr(opt, 'use_pretrained') and opt.use_pretrained and os.path.exists(pretrained_path):
-        encoder.load_state_dict_flexible(torch.load(pretrained_path))
-        print("Loaded existing pretrained encoder.")
-    else:
-        # Safety check - don't overwrite existing good encoder
-        if os.path.exists(pretrained_path):
-            print(f"WARNING: Pretrained encoder already exists at {pretrained_path}")
-            print("To retrain, please manually delete or rename the existing file first.")
-            encoder.load_state_dict_flexible(torch.load(pretrained_path))
-            print("Loaded existing pretrained encoder instead of retraining.")
-        else:
-            print("Starting GNN encoder pretraining")
-            pretrain_graph_encoder(encoder, dataset, device, epochs=getattr(opt, 'pretrain_epochs', 50))
-            torch.save(encoder.state_dict(), pretrained_path)
-            print(f"Pretrained encoder saved to {pretrained_path}")
-elif os.path.exists(pretrained_path):
+if os.path.exists(pretrained_path):
     encoder.load_state_dict_flexible(torch.load(pretrained_path))
     print(f"Loaded pretrained encoder from {pretrained_path}")
 else:
