@@ -6,7 +6,7 @@ def move_all_files_to_parent(folder_path):
     parent_path = os.path.dirname(folder_path)
 
     if not os.path.exists(folder_path):
-        print(f"❌ Folder does not exist: {folder_path}")
+        print(f"Folder does not exist: {folder_path}")
         return
 
     moved_any = False
@@ -25,20 +25,11 @@ def move_all_files_to_parent(folder_path):
             moved_any = True
 
     if not moved_any:
-        print("ℹ️ No files were moved.")
+        print("No files were moved.")
     else:
-        print("🎉 Done moving all files.")
+        print("Done moving all files.")
 
 # 🔧 Set your folder path
-folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/DFC Matrices-20250812T195730Z-1-002'
-
-move_all_files_to_parent(folder)
-folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/DFC Matrices-20250812T195730Z-1-003'
-
-move_all_files_to_parent(folder)
-folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/DFC Matrices-20250812T195730Z-1-004'
-
-move_all_files_to_parent(folder)
-folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/DFC Matrices-20250812T195730Z-1-005'
+folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/Updated_DFC_Matrices-20250818T113349Z-1-001'
 
 move_all_files_to_parent(folder)

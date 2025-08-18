@@ -712,7 +712,7 @@ for fold, split in enumerate(fold_splits, start=1):
     # Conversion-specific accuracy analysis
     label_csv_path = os.path.join("/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data", "TADPOLE_Simplified.csv")
     conversion_results = analyze_conversion_predictions(
-        test_subjects, 
+        te_subj, 
         test_results['predictions'], 
         test_results['targets'], 
         label_csv_path
