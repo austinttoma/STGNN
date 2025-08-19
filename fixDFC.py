@@ -17,11 +17,11 @@ def move_all_files_to_parent(folder_path):
             target_path = os.path.join(parent_path, file)
 
             if os.path.exists(target_path):
-                print(f"⚠️ Skipping '{file}' (already exists in parent folder)")
+                print(f"Skipping '{file}' (already exists in parent folder)")
                 continue
 
             shutil.move(file_full_path, target_path)
-            print(f"✅ Moved '{file}' to parent folder")
+            print(f"Moved '{file}' to parent folder")
             moved_any = True
 
     if not moved_any:
@@ -29,7 +29,7 @@ def move_all_files_to_parent(folder_path):
     else:
         print("Done moving all files.")
 
-# 🔧 Set your folder path
+
 folder = '/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data/DFC_Matrices/Updated_DFC_Matrices-20250818T113349Z-1-001'
 
 move_all_files_to_parent(folder)
