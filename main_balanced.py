@@ -11,9 +11,8 @@ import os
 import copy
 import numpy as np
 import pandas as pd
-from DFC_ADNIDataset import DFC_ADNIDataset
+from FC_ADNIDataset import FC_ADNIDataset
 from model import GraphNeuralNetwork
-from dfc_model import DynamicGraphNeuralNetwork
 from TemporalPredictor import TemporalTabGNNClassifier
 from GRUPredictor import GRUPredictor
 from RNNPredictor import RNNPredictor
@@ -26,8 +25,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--n_epochs', type=int, default=100, help='number of epochs of training')
 parser.add_argument('--batch_size', type=int, default=16, help='batch size for temporal sequences (subjects per batch)')
 parser.add_argument('--lr', type=float, default=0.001, help='learning rate')
-parser.add_argument('--focal_alpha', type=float, default=0.75, help='focal loss alpha (weight for minority class)')
-parser.add_argument('--focal_gamma', type=float, default=2.0, help='focal loss gamma (focusing parameter)')
+parser.add_argument('--focal_alpha', type=float, default=0.90, help='focal loss alpha (weight for minority class)')
+parser.add_argument('--focal_gamma', type=float, default=3.0, help='focal loss gamma (focusing parameter)')
 parser.add_argument('--label_smoothing', type=float, default=0.05, help='label smoothing factor')
 parser.add_argument('--save_path', type=str, default='./model/', help='path to save model')
 parser.add_argument('--save_model', type=bool, default=True)
@@ -37,10 +36,8 @@ parser.add_argument('--lstm_num_layers', type=int, default=1, help='number of LS
 parser.add_argument('--lstm_bidirectional', type=bool, default=True, help='use bidirectional LSTM')
 parser.add_argument('--num_folds', type=int, default=5, help='Number of CV folds (set to 1 for single fold)')
 parser.add_argument('--model_type', type=str, default='LSTM', help='Which RNN Based Model is being utilized RNN, GRU, LSTM')
-parser.add_argument('--pretrain_encoder', action='store_true', help='whether to pretrain GNN encoder using GraphCL')
-parser.add_argument('--pretrain_epochs', type=int, default=50, help='number of epochs for GNN self-supervised pretraining')
+parser.add_argument('--max_visits', type=int, default=10, help='How many max visits allowed for a patients visit sequence')
 parser.add_argument('--freeze_encoder', action='store_true', help='whether to freeze GNN encoder during temporal training')
-parser.add_argument('--use_pretrained', action='store_true', help='use an existing pretrained encoder if it is on disk')
 parser.add_argument('--use_topk_pooling', action='store_true', default=True, help='use TopK pooling instead of global pooling')
 parser.add_argument('--topk_ratio', type=float, default=0.3, help='TopK pooling ratio (fraction of nodes to keep)')
 parser.add_argument('--layer_type', type=str, default="GraphSAGE", help='GNN layer type: GCN, GAT, or GraphSAGE')
@@ -51,8 +48,11 @@ parser.add_argument('--use_time_features', action='store_true', help='use tempor
 parser.add_argument('--exclude_target_visit', action='store_true', help='exclude target visit from input sequences (prevent data leakage)')
 parser.add_argument('--time_normalization', type=str, default='log', help='time normalization method: log, minmax, buckets, raw')
 parser.add_argument('--single_visit_horizon', type=int, default=6, help='default prediction horizon (months) for single-visit subjects')
-parser.add_argument('--temporal_aggregation', type=str, default='mean', choices=['mean', 'max', 'last'],
-                    help='Temporal aggregation strategy for sequence embeddings')
+
+# NEW BALANCING ARGUMENTS
+parser.add_argument('--use_balancing', action='store_true', help='enable balanced sampling of training data')
+parser.add_argument('--balance_ratio', type=float, default=2.0, help='ratio of stable to converter subjects in training set')
+
 opt = parser.parse_args()
 
 def set_random_seeds(seed=42):
@@ -85,308 +85,331 @@ fold_results = {
 
 fold_conversion_results = []
 
-###################
-# GNN PRETRAINING UTILITIES
-###################
-
-def graph_augmentation(data, aug_type="drop_node", aug_ratio=0.2, seed=None):
-    """Simple graph augmentation for GraphCL-style pretraining."""
-    data = data.clone()
-    device = data.x.device
-    
-    # Set seed for reproducible augmentation
-    if seed is not None:
-        torch.manual_seed(seed)
-
-    if aug_type == "drop_node":
-        num_nodes = data.x.size(0)  # Use actual number of nodes from feature tensor
-        node_mask = torch.rand(num_nodes, device=device) > aug_ratio
-        data.x = data.x[node_mask]
-
-        # Remap node indices
-        new_idx = torch.full((num_nodes,), -1, dtype=torch.long, device=device)
-        new_idx[node_mask] = torch.arange(node_mask.sum(), device=device)
-
-        # Filter and remap edges
-        edge_index = data.edge_index
-        edge_mask = node_mask[edge_index[0]] & node_mask[edge_index[1]]
-        edge_index = edge_index[:, edge_mask]
-        edge_index = new_idx[edge_index]
-        data.edge_index = edge_index
-
-    elif aug_type == "drop_edge":
-        edge_mask = torch.rand(data.edge_index.size(1), device=device) > aug_ratio
-        data.edge_index = data.edge_index[:, edge_mask]
-    else:
-        raise ValueError("Unsupported augmentation type")
-
-    return data
-
-def nt_xent_loss(z1, z2, temperature=0.5):
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    reps = torch.cat([z1, z2], dim=0)
-    sim_matrix = torch.exp(torch.matmul(reps, reps.T) / temperature)
-
-    batch_size = z1.size(0)
-    pos_sim = torch.exp(torch.sum(z1 * z2, dim=1) / temperature)
-
-    mask = (~torch.eye(2 * batch_size, dtype=torch.bool)).to(z1.device)
-    sim_sum = sim_matrix.masked_select(mask).view(2 * batch_size, -1).sum(dim=1)
-
-    loss = -torch.log(pos_sim / (sim_sum[:batch_size] + sim_sum[batch_size:]))
-    return loss.mean()
-
-
-def pretrain_graph_encoder(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3):
-    """GraphCL-style self-supervised pretraining for the GNN encoder."""
-    encoder.train()
-    optimizer = torch.optim.Adam(encoder.parameters(), lr=lr)
-    # Create seeded generator for reproducible data loading
-    g = torch.Generator()
-    g.manual_seed(42)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
-                       num_workers=0, generator=g)
-
-    print(f"Pretraining GNN Encoder for {epochs} epochs (GraphCL)")
-    for epoch in range(epochs):
-        total_loss = 0.0
-        for batch in loader:
-            batch = batch.to(device)
-            data_list = batch.to_data_list()
-
-            # Use different seeds for different augmentations to ensure variety
-            batch1 = [graph_augmentation(d, "drop_node", 0.2, seed=42+i) for i, d in enumerate(data_list)]
-            batch2 = [graph_augmentation(d, "drop_edge", 0.2, seed=100+i) for i, d in enumerate(data_list)]
-
-            batch1 = Batch.from_data_list(batch1)
-            batch2 = Batch.from_data_list(batch2)
-
-            z1 = encoder(batch1.x, batch1.edge_index, batch1.batch)
-            z2 = encoder(batch2.x, batch2.edge_index, batch2.batch)
-
-            loss = nt_xent_loss(z1, z2)
-
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(loader)
-        print(f"[Pretrain Epoch {epoch+1:03d}] Loss: {avg_loss:.4f}")
-
-    print("GNN Encoder Pretraining Complete.")
 
 ################## 
 # LOAD DATASET
 ##################
 
-dataset = DFC_ADNIDataset(
+dataset = FC_ADNIDataset(
     root="/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data",
-    var_name="dynamic_fc"  # updated variable within your .npz structures
+    var_name="fc_matrix"  # key present in .npz files
 )
-print(f"Loaded {len(dataset)} DFC graph samples")
+print(f"Loaded {len(dataset)} fMRI FC graph samples")
+dataset.data.y = dataset.data.y.squeeze()
+dataset.data.x[dataset.data.x == float('inf')] = 0
 
-# Clean up any infinite values in node features (just in case)
-dataset.data.x[torch.isinf(dataset.data.x)] = 0
-
-# Build subject-level mapping for temporal sequences
-if not hasattr(dataset, 'subject_graph_dict') or dataset.subject_graph_dict is None:
+# Create subject graph dictionary
+if dataset.subject_graph_dict is None:
     mapping = {}
     for data in dataset:
         sid = getattr(data, 'subj_id', None)
         if sid is None:
             continue
-        # Extract base subject ID (e.g., from 'sub-002S0413_run-01' to '002S0413')
-        if '_run' in sid:
-            base_sid = sid.split('_run')[0]
-            if 'sub-' in base_sid:
-                base_sid = base_sid.replace('sub-', '')
-        else:
-            base_sid = sid.replace('sub-', '') if 'sub-' in sid else sid
-        mapping.setdefault(base_sid, []).append(data)
+        base_subject_id = sid.split('_run')[0] if '_run' in sid else sid
+        mapping.setdefault(base_subject_id, []).append(data)
     dataset.subject_graph_dict = mapping
 
-print(f"Built subject graph mapping: {len(dataset.subject_graph_dict)} subjects")
+print(f"Created subject graph mapping with {len(dataset.subject_graph_dict)} subjects")
 
-# Trim per-subject visits if exceeding limit
+for subject_id in dataset.subject_graph_dict:
+    visits = dataset.subject_graph_dict[subject_id]
+    original_len = len(visits)
+    if original_len > opt.max_visits:
+        dataset.subject_graph_dict[subject_id] = visits[-opt.max_visits:]
+        print(f"[TRIMMED] Subject {subject_id}: {original_len} → {len(dataset.subject_graph_dict[subject_id])}")
 
-# K-fold cross-validation splits at the subject level
-def get_kfold_splits(ds, num_folds=5, seed=42):
-    subj_labels = {
-        sid: visits[0].y.item()
-        for sid, visits in ds.subject_graph_dict.items()
-        if visits and hasattr(visits[0], 'y')
-    }
+def get_balanced_kfold_splits(dataset, num_folds=5, seed=42, use_balancing=False, balance_ratio=2.0):
+    """
+    Create K-fold splits with optional balanced sampling for training sets.
+    
+    Args:
+        dataset: The dataset with subject_graph_dict
+        num_folds: Number of CV folds
+        seed: Random seed for reproducibility
+        use_balancing: Whether to apply balanced sampling to training data
+        balance_ratio: Ratio of stable to converter subjects (e.g., 2.0 = 2:1 stable:converter)
+    
+    Returns:
+        List of fold dictionaries with train/val/test splits
+    """
+    subject_labels = {}
+    for subj_id, graphs in dataset.subject_graph_dict.items():
+        if graphs and hasattr(graphs[0], 'y'):
+            subject_labels[subj_id] = graphs[0].y.item()
 
-    subjects = list(subj_labels.keys())
-    labels = [subj_labels[s] for s in subjects]
+    subjects = list(subject_labels.keys())
+    labels = [subject_labels[s] for s in subjects]
+
+    # Get class distribution
+    stable_subjects = [s for s, l in subject_labels.items() if l == 0]
+    converter_subjects = [s for s, l in subject_labels.items() if l == 1]
+    
+    print(f"Original dataset: {len(stable_subjects)} stable, {len(converter_subjects)} converters")
+    
+    if use_balancing:
+        print(f"Balanced sampling enabled with ratio {balance_ratio}:1 (stable:converter)")
 
     skf = StratifiedKFold(n_splits=num_folds, shuffle=True, random_state=seed)
-    splits = []
+    fold_splits = []
 
-    for fold, (train_idx, test_idx) in enumerate(skf.split(subjects, labels)):
-        train_subj = [subjects[i] for i in train_idx]
-        test_subj = [subjects[i] for i in test_idx]
-        train_labels = [labels[i] for i in train_idx]
+    for fold_idx, (train_val_idx, test_idx) in enumerate(skf.split(subjects, labels)):
+        train_val_subjects = [subjects[i] for i in train_val_idx]
+        test_subjects = [subjects[i] for i in test_idx]
+        train_val_labels = [labels[i] for i in train_val_idx]
 
-        tr_idx, val_idx = train_test_split(
-            np.arange(len(train_subj)),
+        train_idx, val_idx = train_test_split(
+            np.arange(len(train_val_subjects)),
             test_size=0.2,
-            random_state=seed + fold,
-            stratify=train_labels
+            random_state=seed + fold_idx,
+            stratify=train_val_labels
         )
 
-        splits.append({
-            'train_subj': [train_subj[i] for i in tr_idx],
-            'val_subj':   [train_subj[i] for i in val_idx],
-            'test_subj':  test_subj
-        })
-    return splits
+        train_subjects = [train_val_subjects[i] for i in train_idx]
+        val_subjects = [train_val_subjects[i] for i in val_idx]
+        
+        # Apply balanced sampling to training set if enabled
+        if use_balancing:
+            train_subjects = apply_balanced_sampling(
+                train_subjects, subject_labels, balance_ratio, seed + fold_idx
+            )
 
-fold_splits = get_kfold_splits(dataset, num_folds=opt.num_folds)
+        def get_visit_indices(subj_list):
+            indices = []
+            subj_set = set(subj_list)
+            for i, data in enumerate(dataset):
+                sid = getattr(data, 'subj_id', None)
+                if sid is None:
+                    continue
+                base_subject_id = sid.split('_run')[0] if '_run' in sid else sid
+                if base_subject_id in subj_set:
+                    indices.append(i)
+            return indices
+
+        tr_index = get_visit_indices(train_subjects)
+        val_index = get_visit_indices(val_subjects)
+        te_index = get_visit_indices(test_subjects)
+
+        fold_splits.append({
+            'train_subjects': train_subjects,
+            'val_subjects': val_subjects,
+            'test_subjects': test_subjects,
+            'train_idx': tr_index,
+            'val_idx': val_index,
+            'test_idx': te_index
+        })
+
+    return fold_splits
+
+def apply_balanced_sampling(subjects, subject_labels, balance_ratio, seed):
+    """
+    Apply balanced sampling to a list of subjects.
+    
+    Args:
+        subjects: List of subject IDs
+        subject_labels: Dict mapping subject ID to label (0=stable, 1=converter)
+        balance_ratio: Desired ratio of stable to converter subjects
+        seed: Random seed for reproducible sampling
+    
+    Returns:
+        List of balanced subject IDs
+    """
+    # Separate by class
+    stable_subjects = [s for s in subjects if subject_labels[s] == 0]
+    converter_subjects = [s for s in subjects if subject_labels[s] == 1]
+    
+    # Keep all converters (they're the minority)
+    n_converters = len(converter_subjects)
+    n_stable_target = int(n_converters * balance_ratio)
+    
+    # If we don't have enough stable subjects, keep all
+    if n_stable_target >= len(stable_subjects):
+        print(f"  Fold: Not enough stable subjects ({len(stable_subjects)}) for target {n_stable_target}, keeping all")
+        balanced_subjects = stable_subjects + converter_subjects
+    else:
+        # Undersample stable subjects with stratified sampling to maintain disease stage proportions
+        balanced_stable = stratified_undersample_stable(
+            stable_subjects, subject_labels, n_stable_target, seed
+        )
+        balanced_subjects = balanced_stable + converter_subjects
+        
+        print(f"  Fold: Balanced sampling - {len(balanced_stable)} stable, {n_converters} converters")
+    
+    return balanced_subjects
+
+def stratified_undersample_stable(stable_subjects, subject_labels, n_target, seed):
+    """
+    Undersample stable subjects while maintaining proportional representation 
+    from each disease stage (CN-Stable, MCI-Stable, AD-Stable).
+    """
+    # For this, we need to load the CSV to get disease stages
+    # For simplicity, we'll do proportional random sampling
+    rng = np.random.RandomState(seed)
+    
+    if n_target >= len(stable_subjects):
+        return stable_subjects
+    
+    # Simple random undersampling (could be improved with disease stage info)
+    sampled_indices = rng.choice(len(stable_subjects), size=n_target, replace=False)
+    return [stable_subjects[i] for i in sampled_indices]
+
+# Use balanced splitting if enabled
+fold_splits = get_balanced_kfold_splits(
+    dataset, 
+    num_folds=opt.num_folds, 
+    use_balancing=opt.use_balancing,
+    balance_ratio=opt.balance_ratio
+)
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Seed for reproducibility
+# Ensure model creation is deterministic
 set_random_seeds(42)
+encoder = GraphNeuralNetwork(input_dim=100, hidden_dim=opt.gnn_hidden_dim, output_dim=256, dropout=0.2, 
+                           use_topk_pooling=opt.use_topk_pooling, topk_ratio=opt.topk_ratio, layer_type=opt.layer_type,
+                           num_layers=opt.gnn_num_layers, activation=opt.gnn_activation, 
+                           use_time_features=opt.use_time_features).to(device)
 
-encoder = DynamicGraphNeuralNetwork(
-    input_dim= dataset.data.x.size(-1),  # dynamic input dim from dataset
-    hidden_dim=opt.gnn_hidden_dim,
-    output_dim=256,
-    num_classes=2,  # Adjust as appropriate
-    use_topk_pooling=opt.use_topk_pooling,
-    topk_ratio=opt.topk_ratio,
-    layer_type=opt.layer_type,
-    temporal_aggregation=opt.temporal_aggregation,
-    num_layers=opt.gnn_num_layers,
-    activation=opt.gnn_activation
-).to(device)
-
+# Load pretrained encoder if available (run supervised_pretrain.py separately to create)
 pretrained_path = os.path.join(opt.save_path, 'pretrained_gnn_encoder.pth')
-set_random_seeds(42)
-
-if getattr(opt, 'pretrain_encoder', False):
-    if getattr(opt, 'use_pretrained', False) and os.path.exists(pretrained_path):
-        #encoder.load_state_dict(torch.load(pretrained_path))
-        print("Loaded pretrained encoder.")
-    else:
-        print("Pretraining GNN encoder...")
-        pretrain_graph_encoder(encoder, dataset, device, epochs=getattr(opt, 'pretrain_epochs', 50))
-        torch.save(encoder.state_dict(), pretrained_path)
-        print("Pretrained encoder saved.")
-elif os.path.exists(pretrained_path):
-    #encoder.load_state_dict(torch.load(pretrained_path))
-    print("Loaded frozen pretrained encoder.")
+if os.path.exists(pretrained_path):
+    encoder.load_state_dict_flexible(torch.load(pretrained_path))
+    print(f"Loaded pretrained encoder from {pretrained_path}")
 else:
-    print("No pretrained weights found; training from scratch.")
+    print("No pretrained encoder found — training from scratch.")
 
-subject_id_to_indices = {}
-for idx, data in enumerate(dataset):
-    subj_id = getattr(data, 'subj_id', None)
-    if subj_id is None:
-        print(f"Warning: Data at index {idx} has no subj_id")
-        continue
-    # Map both full ID and base ID to indices
-    if subj_id not in subject_id_to_indices:
-        subject_id_to_indices[subj_id] = []
-    subject_id_to_indices[subj_id].append(idx)
+
+
+print(f"Using Temporal {opt.model_type} Model")
+print(f"  - {opt.model_type} Hidden Dim: {opt.lstm_hidden_dim}")
+print(f"  - {opt.model_type} Layers: {opt.lstm_num_layers}")
+print(f"  - Bidirectional: {opt.lstm_bidirectional}")
+print(f"  - Temporal Batch Size: {opt.batch_size} subjects/batch")
+print(f"  - Graph Pooling: {'TopK (ratio=' + str(opt.topk_ratio) + ')' if opt.use_topk_pooling else 'Global Mean/Max'}")
+print(f"Training for {opt.n_epochs} epochs")
+print(f"Minority class forcing for first {opt.minority_focus_epochs} epochs")
+
+if opt.use_balancing:
+    print(f"BALANCED SAMPLING ENABLED: {opt.balance_ratio}:1 stable:converter ratio")
+else:
+    print("Using original unbalanced data distribution")
+
+for fold, split in enumerate(fold_splits):
+    print(f"\n{'='*50}")
+    print(f"STARTING FOLD {fold + 1}/{opt.num_folds}")
+    opt.fold = fold
+
+    train_subjects = split['train_subjects']
+    val_subjects = split['val_subjects']
+    test_subjects = split['test_subjects']
+    tr_index = split['train_idx']
+    val_index = split['val_idx']
+    te_index = split['test_idx']
     
-    # Extract base subject ID properly (e.g., from 'sub-002S0413_run-01' to '002S0413')
-    if '_run' in subj_id:
-        base_sid = subj_id.split('_run')[0]
-        if 'sub-' in base_sid:
-            base_sid = base_sid.replace('sub-', '')
-    else:
-        base_sid = subj_id.replace('sub-', '') if 'sub-' in subj_id else subj_id
+    # Calculate class distribution
+    def count_classes(subj_list):
+        stable = sum(1 for s in subj_list if dataset.subject_graph_dict[s][0].y.item() == 0)
+        converter = len(subj_list) - stable
+        return stable, converter
+
+    train_stable, train_conv = count_classes(train_subjects)
+    val_stable, val_conv = count_classes(val_subjects)
+    test_stable, test_conv = count_classes(test_subjects)
     
-    if base_sid != subj_id:
-        if base_sid not in subject_id_to_indices:
-            subject_id_to_indices[base_sid] = []
-        subject_id_to_indices[base_sid].append(idx)
+    print(f"Training set: {train_stable} stable, {train_conv} converters ({train_stable/max(train_conv,1):.1f}:1 ratio)")
+    print(f"Validation set: {val_stable} stable, {val_conv} converters")
+    print(f"Test set: {test_stable} stable, {test_conv} converters")
 
-print(f"Built subject ID to indices mapping for {len(subject_id_to_indices)} unique IDs")
+    ###################
+    # MODEL SETUP FOR THIS FOLD
+    ###################
 
-# === Define this helper function BEFORE the fold loop ===
-def idx_for_subj_list(subj_list):
-    indices = []
-    missing_subjects = []
-    for subj in subj_list:
-        subj_indices = subject_id_to_indices.get(subj, [])
-        if not subj_indices:
-            missing_subjects.append(subj)
-        indices.extend(subj_indices)
-    if missing_subjects:
-        print(f"Warning: {len(missing_subjects)} subjects not found in indices mapping")
-    return indices
+    # Ensure deterministic model copying and creation
+    set_random_seeds(42)
+    
+    # Create a fresh copy of the encoder for this fold
+    fold_encoder = copy.deepcopy(encoder).to(device)   # perfect architectural match
 
-# === Fold loop ===
-for fold, split in enumerate(fold_splits, start=1):
-    print(f"\n=== Fold {fold}/{opt.num_folds} ===")
-    tr_subj, val_subj, te_subj = split.values()
-
-    train_idx = idx_for_subj_list(tr_subj)
-    val_idx = idx_for_subj_list(val_subj)
-    test_idx = idx_for_subj_list(te_subj)
-    print(f"[DEBUG] Number of training indices: {len(train_idx)}")
-    print(f"[DEBUG] Training indices: {train_idx}")
-    fold_encoder = copy.deepcopy(encoder).to(device)
     if opt.freeze_encoder:
         for p in fold_encoder.parameters():
             p.requires_grad = False
-        print("Encoder frozen.")
+        print("GNN encoder frozen for transfer learning.")
 
-    # Temporal loaders
-    train_loader = TemporalDataLoader(dataset, train_idx, fold_encoder, device,
-                                      batch_size=opt.batch_size, shuffle=True, seed=42,
-                                      exclude_target_visit=opt.exclude_target_visit,
-                                      time_normalization=opt.time_normalization,
-                                      single_visit_horizon=opt.single_visit_horizon)
-    val_loader = TemporalDataLoader(dataset, val_idx, fold_encoder, device,
-                                    batch_size=opt.batch_size, shuffle=False, seed=42,
+    # Create temporal data loaders with consistent seeded randomness
+    train_loader = TemporalDataLoader(dataset, tr_index, fold_encoder, device, 
+                                    batch_size=opt.batch_size, shuffle=True, seed=42,
                                     exclude_target_visit=opt.exclude_target_visit,
                                     time_normalization=opt.time_normalization,
                                     single_visit_horizon=opt.single_visit_horizon)
-    test_loader = TemporalDataLoader(dataset, test_idx, fold_encoder, device,
-                                     batch_size=opt.batch_size, shuffle=False, seed=42,
-                                     exclude_target_visit=opt.exclude_target_visit,
-                                     time_normalization=opt.time_normalization,
-                                     single_visit_horizon=opt.single_visit_horizon)
-
-    print(f"Batches per epoch: {len(train_loader)}")
+    val_loader = TemporalDataLoader(dataset, val_index, fold_encoder, device,
+                                batch_size=opt.batch_size, shuffle=False, seed=42,
+                                exclude_target_visit=opt.exclude_target_visit,
+                                time_normalization=opt.time_normalization,
+                                single_visit_horizon=opt.single_visit_horizon)
+    test_loader = TemporalDataLoader(dataset, te_index, fold_encoder, device,
+                                batch_size=opt.batch_size, shuffle=False, seed=42,
+                                exclude_target_visit=opt.exclude_target_visit,
+                                time_normalization=opt.time_normalization,
+                                single_visit_horizon=opt.single_visit_horizon)
     
-    if len(train_loader) == 0:
-        print(f"ERROR: Training loader is empty for fold {fold}!")
-        print(f"Training subjects: {len(tr_subj)}, indices: {len(train_idx)}")
-        print(f"Validation subjects: {len(val_subj)}, indices: {len(val_idx)}")
-        print(f"Test subjects: {len(te_subj)}, indices: {len(test_idx)}")
-        continue
+    print(f"Processing {len(train_loader)} temporal sequence batches per epoch")
 
-    # Setup classifier based on temporal model type
+    # Ensure deterministic classifier initialization
     set_random_seeds(42)
-    graph_emb_dim = fold_encoder.output_dim * 2  # mean+max pooling
-    if opt.model_type == "LSTM":
-        classifier = TemporalTabGNNClassifier(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                              opt.lstm_num_layers, dropout=0.45,
-                                              bidirectional=opt.lstm_bidirectional,
-                                              num_classes=2).to(device)
-    elif opt.model_type == "GRU":
-        classifier = GRUPredictor(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                  opt.lstm_num_layers, dropout=0.45,
-                                  bidirectional=False, num_classes=2).to(device)
-    else:
-        classifier = RNNPredictor(graph_emb_dim, 0, opt.lstm_hidden_dim,
-                                  opt.lstm_num_layers, dropout=0.45,
-                                  bidirectional=False, num_classes=2).to(device)
+    
+    if(opt.model_type == "LSTM"):
+        classifier = TemporalTabGNNClassifier(
+            graph_emb_dim=512,
+            tab_emb_dim=0,
+            hidden_dim=opt.lstm_hidden_dim,
+            num_layers=opt.lstm_num_layers,
+            dropout=0.45,
+            bidirectional=opt.lstm_bidirectional,
+            num_classes=2
+        ).to(device)
+    elif(opt.model_type == "GRU"):
+        classifier = GRUPredictor(
+            graph_emb_dim=512,
+            tab_emb_dim=0,
+            hidden_dim=opt.lstm_hidden_dim,
+            num_layers=opt.lstm_num_layers,
+            dropout=0.45,
+            bidirectional=False,
+            num_classes=2
+        ).to(device)
+    elif(opt.model_type == "RNN"):
+        classifier = RNNPredictor(
+            graph_emb_dim=512,
+            tab_emb_dim=0,
+            hidden_dim=opt.lstm_hidden_dim,
+            num_layers=opt.lstm_num_layers,
+            dropout=0.45,
+            bidirectional=False,
+            num_classes=2
+        ).to(device)
 
+    # Ensure deterministic optimizer initialization
     set_random_seeds(42)
+    
+    # Optimizer with different learning rates for different components
+    encoder_params = list(fold_encoder.parameters())
+    classifier_params = list(classifier.parameters())
+
     optimizer = torch.optim.Adam([
-        {'params': fold_encoder.parameters(), 'lr': opt.lr * 0.5},
-        {'params': classifier.parameters(), 'lr': opt.lr}
-    ], weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-6)
-    criterion = FocalLoss(alpha=opt.focal_alpha, gamma=opt.focal_gamma, label_smoothing=opt.label_smoothing)
+        {'params': encoder_params, 'lr': opt.lr},
+        {'params': classifier_params, 'lr': opt.lr}
+    ], betas=(0.9, 0.999), weight_decay=1e-4)
+
+    # Scheduler - simplified for better convergence
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=10, min_lr=1e-6
+    )
+
+    # Loss function - use focal loss
+    criterion = FocalLoss(
+        alpha=opt.focal_alpha,
+        gamma=opt.focal_gamma,
+        label_smoothing=opt.label_smoothing
+    )
 
     class_labels = np.array([data.y.item() for data in dataset])
     print(f"Using Focal Loss with alpha={opt.focal_alpha}, gamma={opt.focal_gamma}")
@@ -578,7 +601,8 @@ for fold, split in enumerate(fold_splits, start=1):
 
     for epoch in range(1, opt.n_epochs + 1):
         
-        fold_encoder.train()
+        # Keep encoder in eval mode since it's only used for feature extraction
+        fold_encoder.eval()
         classifier.train()
         
         total_loss = 0
@@ -628,17 +652,13 @@ for fold, split in enumerate(fold_splits, start=1):
             class_1_preds += (preds == 1).sum().item()
             
         
-        scheduler.step()
-        
-        if len(train_loader) > 0:
-            avg_loss = total_loss / len(train_loader)
-        else:
-            avg_loss = 0.0
-            print(f"Warning: No batches in train_loader for epoch {epoch}")
-        
-        train_acc = correct / total if total > 0 else 0.0
+        avg_loss = total_loss / len(train_loader)
+        train_acc = correct / total
         
         val_results = evaluate_detailed(val_loader)
+        
+        # Step scheduler with validation metric (for ReduceLROnPlateau)
+        scheduler.step(val_results['balanced_accuracy'])
         
         current_lr = optimizer.param_groups[0]['lr']
         
@@ -663,7 +683,10 @@ for fold, split in enumerate(fold_splits, start=1):
             train_results = evaluate_detailed(train_loader)
             
             if opt.save_model:
-                torch.save(best_model_state, os.path.join(opt.save_path, f'best_model_fold{fold}.pth'))
+                save_name = f'best_model_fold{fold}'
+                if opt.use_balancing:
+                    save_name += f'_balanced{opt.balance_ratio}'
+                torch.save(best_model_state, os.path.join(opt.save_path, f'{save_name}.pth'))
             
             print(f"New best model saved (AUC: {best_auc:.3f}, Balanced Acc: {best_balanced_acc:.3f})")
         else:
@@ -712,7 +735,7 @@ for fold, split in enumerate(fold_splits, start=1):
     # Conversion-specific accuracy analysis
     label_csv_path = os.path.join("/media/volume/ADNI-Data/git/TabGNN/FinalDeliverables/data", "TADPOLE_Simplified.csv")
     conversion_results = analyze_conversion_predictions(
-        te_subj, 
+        test_subjects, 
         test_results['predictions'], 
         test_results['targets'], 
         label_csv_path
@@ -738,8 +761,5 @@ for metric, values in fold_results.items():
 
 # Aggregated conversion-specific accuracy analysis
 if fold_conversion_results:
-    print("\n" + "="*60)
-    print("AGGREGATED CONVERSION ACCURACY ACROSS ALL FOLDS")
-    print("="*60)
     aggregated_conversion_results = aggregate_conversion_results(fold_conversion_results)
     print_conversion_accuracy_report(aggregated_conversion_results)

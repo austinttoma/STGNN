@@ -3,16 +3,6 @@ import numpy as np
 from collections import defaultdict
 
 def get_subject_conversion_type(subject_id, label_df):
-    """
-    Determine the conversion type for a subject based on their baseline group and conversion status.
-    
-    Args:
-        subject_id (str): Subject ID (e.g., '002S0295')
-        label_df (pd.DataFrame): DataFrame with subject visit data
-    
-    Returns:
-        str: Conversion type ('CN-Stable', 'CN->MCI', 'MCI-Stable', 'MCI->AD', 'AD-Stable', 'Unknown')
-    """
     # Filter visits for this subject
     subject_visits = label_df[label_df['Subject'] == subject_id].sort_values('Visit_idx')
     

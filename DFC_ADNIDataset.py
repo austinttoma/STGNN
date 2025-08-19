@@ -61,18 +61,18 @@ class DFC_ADNIDataset(InMemoryDataset):
                     base_subj_id = subj_id.split('_run')[0]
 
                 if base_subj_id not in label_dict:
-                    print(f"⚠️ No label found for subject {base_subj_id}, defaulting to 0")
+                    print(f"No label found for subject {base_subj_id}, defaulting to 0")
                 label = torch.tensor([label_dict.get(base_subj_id, 0)], dtype=torch.long)
 
                 with np.load(file_path) as data:
                     if self.var_name not in data.files:
-                        print(f"❌ '{self.var_name}' missing in {file_path}, skipping.")
+                        print(f"'{self.var_name}' missing in {file_path}, skipping.")
                         continue
 
                     dfc_array = data[self.var_name]  # Shape: (T, N, N)
 
                 if dfc_array.ndim != 3:
-                    print(f"❌ Unexpected shape in {filename}: {dfc_array.shape}")
+                    print(f"Unexpected shape in {filename}: {dfc_array.shape}")
                     continue
 
                 time_len = dfc_array.shape[0]
@@ -90,7 +90,7 @@ class DFC_ADNIDataset(InMemoryDataset):
                     subj_id_list.append(subj_id)  # Store subject ID
 
             except Exception as e:
-                print(f"❌ Failed to process {file_path}: {e}")
+                print(f"Failed to process {file_path}: {e}")
 
         data, slices = self.collate(data_list)
         # Save subject IDs along with the data
