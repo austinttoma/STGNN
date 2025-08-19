@@ -52,14 +52,20 @@ def pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=
         nn.Linear(128, 2)
     ).to(device)
     
-    # Optimizer for both encoder and classifier
+    # Optimizer for both encoder and classifier with better parameters
     optimizer = torch.optim.Adam(
         list(encoder.parameters()) + list(classifier.parameters()), 
-        lr=lr, weight_decay=1e-5
+        lr=lr, weight_decay=1e-4
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, min_lr=1e-5
+        optimizer, mode='max', factor=0.7, patience=10, min_lr=1e-6
     )
+    
+    # Use class weights to handle imbalance
+    class_counts = torch.bincount(dataset.data.y)
+    class_weights = 1.0 / class_counts.float()
+    class_weights = class_weights / class_weights.sum() * len(class_weights)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights.to(device))
     
     print(f"Supervised Pretraining for {epochs} epochs")
     print(f"Train samples: {len(train_idx)}, Val samples: {len(val_idx)}")
@@ -81,7 +87,7 @@ def pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=
             # Forward pass
             embeddings = encoder(batch.x, batch.edge_index, batch.batch)
             logits = classifier(embeddings)
-            loss = F.cross_entropy(logits, batch.y)
+            loss = criterion(logits, batch.y)
             
             # Backward pass
             optimizer.zero_grad()
@@ -177,7 +183,7 @@ def main():
     print(f"  TopK ratio: 0.3\n")
     
     # Pretrain with supervision
-    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3)
+    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=100, batch_size=32, lr=1e-3)
     
     # Save the pretrained encoder
     save_path = "./model/pretrained_gnn_encoder.pth"

@@ -107,12 +107,23 @@ if dataset.subject_graph_dict is None:
 
 print(f"Created subject graph mapping with {len(dataset.subject_graph_dict)} subjects")
 
-for subject_id in dataset.subject_graph_dict:
+# Filter out single-visit subjects for temporal prediction
+single_visit_subjects = []
+for subject_id in list(dataset.subject_graph_dict.keys()):
     visits = dataset.subject_graph_dict[subject_id]
     original_len = len(visits)
+    
+    if original_len == 1:
+        single_visit_subjects.append(subject_id)
+        del dataset.subject_graph_dict[subject_id]
+        continue
+        
     if original_len > opt.max_visits:
         dataset.subject_graph_dict[subject_id] = visits[-opt.max_visits:]
         print(f"[TRIMMED] Subject {subject_id}: {original_len} → {len(dataset.subject_graph_dict[subject_id])}")
+
+print(f"Excluded {len(single_visit_subjects)} single-visit subjects for temporal prediction")
+print(f"Remaining subjects for temporal analysis: {len(dataset.subject_graph_dict)}")
 
 def get_kfold_splits(dataset, num_folds=5, seed=42):
     subject_labels = {}
@@ -498,8 +509,11 @@ for fold, split in enumerate(fold_splits):
 
     for epoch in range(1, opt.n_epochs + 1):
         
-        # Keep encoder in eval mode since it's only used for feature extraction
-        fold_encoder.eval()
+        # Set models to training mode (unless encoder is frozen)
+        if not opt.freeze_encoder:
+            fold_encoder.train()
+        else:
+            fold_encoder.eval()
         classifier.train()
         
         total_loss = 0
