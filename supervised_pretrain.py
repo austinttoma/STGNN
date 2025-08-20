@@ -177,7 +177,7 @@ def main():
     print(f"  TopK ratio: 0.3\n")
     
     # Pretrain with supervision
-    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=50, batch_size=32, lr=1e-3)
+    encoder = pretrain_encoder_supervised(encoder, dataset, device, epochs=100, batch_size=32, lr=1e-3)
     
     # Save the pretrained encoder
     save_path = "./model/pretrained_gnn_encoder.pth"
