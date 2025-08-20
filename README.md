@@ -2,9 +2,9 @@
 
 Spatiotemporal Graph Neural Network for predicting cognitive stage conversion using rs-fMRI data from ADNI.
 
-This project predicts Alzheimer's disease progression by combining Graph Neural Networks for brain connectivity analysis with RNNs for temporal modeling across patient visits. Best performance achieved with GraphSAGE-LSTM architecture: 67.7% test accuracy, 63.9% balanced accuracy, and 68.4% AUC.
+This project predicts Alzheimer's disease progression by combining Graph Neural Networks for brain connectivity analysis with RNNs for temporal modeling across patient visits. Best performance achieved with a GraphSAGE-LSTM architecture: 82.9% test accuracy, 77.1% balanced accuracy, and 85.4% AUC.
 
-**Paper**: "The Effectiveness of using rs-fMRI for Prediction of Cognitive Impairment Stage Conversion"
+**Paper**: "Predicting Alzheimer’s Disease Progression Using rs-fMRI and a History-Aware Graph Neural Network"
 
 ```bash
 pip install -r requirements.txt
